@@ -17,7 +17,7 @@ class CalendarHistory:
         self.seeding = False
         self.pending = []
 
-    def open(self, account):
+    def open(self, account, *, start_import=True):
         digest = sha256(account.strip().casefold().encode("utf-8")).hexdigest()
         self.key = "calendarHistory/" + digest
         try:
@@ -28,45 +28,51 @@ class CalendarHistory:
             self.data, self.seeded = None, False
         self.seeding = False
         self.pending = []
-        self.seed()
+        if start_import:
+            self.seed()
 
     def seed(self):
         owner = self.owner
-        if not self.key or self.seeded or self.seeding or not owner.preferences.suggest_calendars:
+        if (not self.key or self.seeded or self.seeding or owner.reading or owner.jobs.stopping.is_set()
+                or not owner.preferences.suggest_calendars):
             return
         calendars = [calendar for calendar in owner.calendars if calendar.writable]
         if not calendars or not owner.store:
             return
         store, key = owner.store, self.key
+        core, stopping = owner.core, owner.jobs.stopping
         end = owner.now()
         start = end - timedelta(days=180)
         self.seeding = True
 
-        def read():
-            with ThreadPoolExecutor(max_workers=4) as workers:
-                batches = workers.map(lambda calendar: store.events(calendar, start, end, end.tzinfo), calendars)
-                events = [event for batch in batches for event in batch
-                          if not event.recurring and event.start.timestamp() < end.timestamp()]
-            # Keep order deterministic and avoid counting one event twice when a save finishes during import.
-            return [(event.title, event.calendar.url, event.start.timestamp())
-                    for event in sorted(events, key=lambda entry: (entry.start.timestamp(), entry.key))][-10000:]
+        def load(calendar):
+            return [] if stopping.is_set() else store.events(calendar, start, end, end.tzinfo)
 
-        def complete(records, error):
+        def read():
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                events = [event for batch in workers.map(load, calendars) for event in batch
+                          if not event.recurring and event.start.timestamp() < end.timestamp()]
+            if stopping.is_set():
+                return None
+            records = [(event.title, event.calendar.url, event.start.timestamp())
+                       for event in sorted(events, key=lambda entry: (entry.start.timestamp(), entry.key))][-10000:]
+            usage = core.call("learnCalendars", choices=[{"title": title, "calendarID": calendar}
+                                                        for title, calendar, _ in records])
+            return usage, set(records)
+
+        def complete(result, error):
             if key != self.key or store is not owner.store:
                 return
             self.seeding = False
-            if not error:
-                seen = set(records)
-                pending = [item for item in self.pending if item not in seen]
-                self.pending.clear()
-                self.seeded = self.learn([*records, *pending], baseline=True)
-                if self.seeded:
-                    self.save()
-            else:
-                pending, self.pending = self.pending, []
-                if pending:
-                    self.learn(pending)
-                    self.save()
+            pending, self.pending = self.pending, []
+            if not error and result is not None:
+                self.data, seen = result
+                self.seeded = True
+                pending = [item for item in pending if item not in seen]
+            if pending:
+                self.learn(pending)
+            if self.seeded or pending:
+                self.save()
             owner.history_changed.emit()
 
         owner.work(read, complete)
@@ -85,10 +91,10 @@ class CalendarHistory:
             self.save()
             self.owner.history_changed.emit()
 
-    def learn(self, records, *, baseline=False):
+    def learn(self, records):
         try:
             self.data = self.owner.core.call(
-                "learnCalendars", usage=None if baseline else self.data,
+                "learnCalendars", usage=self.data,
                 choices=[{"title": title, "calendarID": calendar} for title, calendar, _ in records],
             )
             return True

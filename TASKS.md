@@ -93,4 +93,5 @@ Physical-device startup was verified. Simulator runs, calendar writes, VoiceOver
 - Verify discovery and conditional writes with fixtures before testing on a disposable iCloud calendar.
 - Added drag-to-create in Day and Week, before/after editing and display preferences, and local calendar profiles with ordering and accents.
 - Added Linux event edge resizing, calendar suggestions, activity icons, a desktop launcher, and GitHub update checks.
+- Deliver background load results on the GUI thread, load the visible range before importing history, and install launcher icons at 256px and 512px.
 - Add Google Tasks, colour categories, and support for mutating recurring and linked events after the initial preview.

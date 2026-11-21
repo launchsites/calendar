@@ -7,10 +7,13 @@ import struct
 import subprocess
 import sys
 
+from PySide6 import QtCore, QtGui
+
 
 APP_ID = "com.example.stillday.calendar"
 ROOT = Path(__file__).resolve().parents[1]
 REVISION = re.compile(r"[0-9a-f]{40}")
+ICON_SIZES = (256, 512)
 
 
 def data_home():
@@ -34,6 +37,34 @@ def icon_png(root=ROOT):
             return payload
         offset += size
     raise ValueError("Calendar app icon has no PNG representation")
+
+
+def icon_file(home, size):
+    return home / f"icons/hicolor/{size}x{size}/apps/{APP_ID}.png"
+
+
+def source_image(root):
+    image = QtGui.QImage.fromData(icon_png(root))
+    if image.isNull():
+        raise ValueError("Calendar app icon could not be decoded")
+    return image
+
+
+def scaled(image, size):
+    return image.scaled(size, size, QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                        QtCore.Qt.TransformationMode.SmoothTransformation)
+
+
+def window_icon(root=ROOT, home=None):
+    home = home or data_home()
+    image = QtGui.QImage(str(icon_file(home, max(ICON_SIZES))))
+    if image.isNull():
+        image = source_image(root)
+    icon = QtGui.QIcon()
+    # Window managers need small icons. Keep the X11 icon property below its request limit.
+    for size in (32, 64, 128):
+        icon.addPixmap(QtGui.QPixmap.fromImage(scaled(image, size)))
+    return icon
 
 
 def source_revision(root):
@@ -66,24 +97,34 @@ def write_atomic(path, content):
     temporary.replace(path)
 
 
-def exec_argument(path):
-    value = str(path)
+def desktop_value(value):
     if any(ord(char) < 32 or ord(char) == 127 for char in value):
         raise ValueError("Install Calendar from a folder whose path contains no control characters.")
-    escaped = value.replace("%", "%%")
+    return value.replace("\\", "\\\\")
+
+
+def exec_argument(path):
+    escaped = str(path).replace("%", "%%")
     for char in ('\\', '"', '`', '$'):
         escaped = escaped.replace(char, "\\" + char)
-    return '"' + escaped.replace("\\", "\\\\") + '"'
+    return '"' + desktop_value(escaped) + '"'
 
 
 def install(root=ROOT, home=None):
     home = home or data_home()
-    write_atomic(home / f"icons/hicolor/1024x1024/apps/{APP_ID}.png", icon_png(root))
+    icon = desktop_value(str(icon_file(home, max(ICON_SIZES))))
+    image = source_image(root)
+    for size in ICON_SIZES:
+        encoded = QtCore.QBuffer()
+        encoded.open(QtCore.QIODevice.OpenModeFlag.WriteOnly)
+        if not scaled(image, size).save(encoded, "PNG"):
+            raise ValueError("Calendar app icon could not be encoded")
+        write_atomic(icon_file(home, size), bytes(encoded.data()))
     desktop = (
         "[Desktop Entry]\nType=Application\nName=Calendar\n"
         "Comment=View and edit your calendars\n"
         f"Exec={exec_argument(root / 'Scripts/run-linux')}\n"
-        f"Icon={APP_ID}\nStartupWMClass={APP_ID}\n"
+        f"Icon={icon}\nStartupWMClass={APP_ID}\n"
         "Terminal=false\nCategories=Office;Calendar;\n"
     )
     write_atomic(home / f"applications/{APP_ID}.desktop", desktop.encode())

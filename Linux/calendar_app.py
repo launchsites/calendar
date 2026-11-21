@@ -18,8 +18,9 @@ from tzlocal import get_localzone
 from caldav_store import Calendar, CalendarError, Draft, Event, ICloudStore, local_time
 from desktop_style import CheckBox, DesktopStyle, EventButton, button, icon, label
 from calendar_settings import Buffer, Preferences, SettingsDialog, edit_buffer
-from calendar_install import APP_ID, icon_png, installed_revision
+from calendar_install import APP_ID, installed_revision, window_icon
 from calendar_history import CalendarHistory
+from background_jobs import BackgroundJobs
 from activity_icons import activity_icon
 from calendar_update import install_update, latest_revision
 from calendar_timeline import GUTTER, SCROLLBAR, Timeline
@@ -53,27 +54,6 @@ class Core:
         if "error" in response:
             raise CalendarError(response["error"])
         return response["value"]
-
-
-class WorkerSignals(QtCore.QObject):
-    done = QtCore.Signal(object, str)
-
-
-class Worker(QtCore.QRunnable):
-    def __init__(self, action):
-        super().__init__()
-        self.action = action
-        self.signals = WorkerSignals()
-
-    def run(self):
-        try:
-            result = self.action()
-        except CalendarError as error:
-            self.signals.done.emit(None, str(error))
-        except Exception:
-            self.signals.done.emit(None, "An event or calendar response could not be read. Try refreshing.")
-        else:
-            self.signals.done.emit(result, "")
 
 
 class Editor(Qt.QDialog):
@@ -314,7 +294,8 @@ class Editor(Qt.QDialog):
             if not self.original:
                 self.owner.history.record(draft.title, calendar, draft.start)
 
-        self.write(lambda: store.save(calendar, draft, self.original), learn)
+        original = self.original
+        self.write(lambda: store.save(calendar, draft, original), learn)
 
     def delete(self):
         answer = Qt.QMessageBox.question(self, "Delete event", f"Delete “{self.original.title}” from iCloud?",
@@ -322,7 +303,8 @@ class Editor(Qt.QDialog):
                                          Qt.QMessageBox.StandardButton.Cancel)
         if answer == Qt.QMessageBox.StandardButton.Yes:
             store = self.owner.store
-            self.write(lambda: store.delete(self.original))
+            original = self.original
+            self.write(lambda: store.delete(original))
 
     def write(self, action, saved=None):
         self.buttons.setEnabled(False)
@@ -340,7 +322,7 @@ class Editor(Qt.QDialog):
                 self.accept()
                 self.owner.refresh()
 
-        self.owner.work(action, finish)
+        self.owner.work(action, finish, cancel_on_close=False)
 
     def reject(self):
         if not getattr(self, "writing", False):
@@ -363,9 +345,8 @@ class CalendarWindow(Qt.QMainWindow):
         self.update_message = "Check GitHub for a newer version."
         self.update_busy = False
         self.update_launcher = None
-        self.pool = QtCore.QThreadPool(self)
-        self.pool.setMaxThreadCount(2)
-        self.workers = set()
+        self.jobs = BackgroundJobs(self)
+        Qt.QApplication.instance().aboutToQuit.connect(self.jobs.stop)
         self.day, self.mode = self.now().date(), "Week"
         self.navigator_month = self.day.replace(day=1)
         self.store, self.calendars, self.events = None, [], []
@@ -418,6 +399,8 @@ class CalendarWindow(Qt.QMainWindow):
         Qt.QApplication.instance().styleHints().colorSchemeChanged.connect(
             lambda scheme: self.apply_appearance() if self.appearance == "System" else None
         )
+        self.render_timer = QtCore.QTimer(self, interval=50, singleShot=True)
+        self.render_timer.timeout.connect(self.render)
         self.timer = QtCore.QTimer(self, interval=180000)
         self.timer.timeout.connect(self.refresh)
         self.timer.start()
@@ -425,6 +408,14 @@ class CalendarWindow(Qt.QMainWindow):
         self.update_timer.timeout.connect(self.check_updates)
         self.update_timer.start()
         self.apply_appearance()
+
+    def closeEvent(self, event):
+        super().closeEvent(event)
+        if event.isAccepted():
+            self.jobs.stop()
+            self.timer.stop()
+            self.update_timer.stop()
+            self.render_timer.stop()
 
     def icon_button(self, glyph, name, action, *, size=(34, 34)):
         item = button(variant="nav", name=name, size=size)
@@ -614,6 +605,7 @@ class CalendarWindow(Qt.QMainWindow):
             group.addAction(action)
             action.triggered.connect(lambda checked=False, mode=name: self.set_appearance(mode))
         menu.exec(self.menu_button.mapToGlobal(QtCore.QPoint(0, self.menu_button.height() + 4)))
+        menu.deleteLater()
 
     def fill_profile_menu(self, menu):
         group = QtGui.QActionGroup(menu)
@@ -631,6 +623,7 @@ class CalendarWindow(Qt.QMainWindow):
         menu.addSeparator()
         menu.addAction("Manage profiles…", self.open_settings)
         menu.exec(self.profile_button.mapToGlobal(QtCore.QPoint(0, self.profile_button.height())))
+        menu.deleteLater()
 
     def open_settings(self, updates=False):
         dialog = SettingsDialog(self)
@@ -655,7 +648,7 @@ class CalendarWindow(Qt.QMainWindow):
         return notice
 
     def check_updates(self):
-        if self.update_busy or self.update_launcher:
+        if self.jobs.stopping.is_set() or self.update_busy or self.update_launcher:
             return
         self.update_busy = True
         self.update_message = "Checking GitHub…"
@@ -705,7 +698,7 @@ class CalendarWindow(Qt.QMainWindow):
                 self.update_notice.show()
             self.update_changed.emit()
 
-        self.work(lambda: install_update(revision), done)
+        self.work(lambda: install_update(revision), done, cancel_on_close=False)
 
     def select_profile(self, profile_id):
         self.preferences.current = profile_id
@@ -789,6 +782,8 @@ class CalendarWindow(Qt.QMainWindow):
 
 
     def start(self):
+        if self.jobs.stopping.is_set():
+            return
         username = self.settings.value("iCloudEmail", "", str)
         if username:
             try:
@@ -798,16 +793,8 @@ class CalendarWindow(Qt.QMainWindow):
             if password:
                 self.connect_account(username, password, remember=False)
 
-    def work(self, action, done):
-        worker = Worker(action)
-        self.workers.add(worker)
-
-        def finish(result, error):
-            self.workers.discard(worker)
-            done(result, error)
-
-        worker.signals.done.connect(finish, QtCore.Qt.ConnectionType.QueuedConnection)
-        self.pool.start(worker)
+    def work(self, action, done, *, cancel_on_close=True):
+        self.jobs.submit(action, done, cancel_on_close=cancel_on_close)
 
     def start_of_week(self, day):
         return day - timedelta(days=(day.weekday() - self.preferences.week_start) % 7)
@@ -881,7 +868,7 @@ class CalendarWindow(Qt.QMainWindow):
 
     def connect_account(self, username, password, remember):
         self.connecting = True
-        store = ICloudStore(username, password)
+        store = ICloudStore(username, password, stop_reads=self.jobs.stopping)
         self.set_status("Connecting to iCloud…", "working")
 
         def done(calendars, error):
@@ -898,8 +885,8 @@ class CalendarWindow(Qt.QMainWindow):
                     keyring.backends.SecretService.Keyring().set_password(SERVICE, username, password)
                 except Exception:
                     self.session_notice = "One-session sign-in. The system keyring is unavailable."
+            self.history.open(username, start_import=False)
             self.refresh()
-            self.history.open(username)
 
         self.work(store.discover, done)
 
@@ -948,7 +935,7 @@ class CalendarWindow(Qt.QMainWindow):
         return set(self.settings.value("hiddenCalendars", [], list))
 
     def refresh(self):
-        if not self.store:
+        if self.jobs.stopping.is_set() or not self.store:
             return
         if self.reading:
             self.refresh_pending = True
@@ -958,11 +945,13 @@ class CalendarWindow(Qt.QMainWindow):
         pad = timedelta(days=1 if self.mode in ("Day", "Week") else 0)
         start, end = midnight(days[0]) - pad, midnight(days[-1] + timedelta(days=1)) + pad
         visible = [item for item in self.calendars if item.url not in self.hidden()]
-        store = self.store
+        store, stopping = self.store, self.jobs.stopping
         self.set_status("Refreshing calendars…", "working")
 
         def read():
             def load(calendar):
+                if stopping.is_set():
+                    return [], None
                 try:
                     return store.events(calendar, start, end, ZONE), None
                 except CalendarError as error:
@@ -1001,6 +990,8 @@ class CalendarWindow(Qt.QMainWindow):
             else:
                 count = "1 calendar" if len(visible) == 1 else f"{len(visible)} calendars"
                 self.set_status(getattr(self, "session_notice", "") or f"{count} · iCloud up to date", "ready")
+            if not failures:
+                self.history.seed()
 
         self.work(read, done)
 
@@ -1017,9 +1008,17 @@ class CalendarWindow(Qt.QMainWindow):
             widget.deleteLater()
 
     def render(self):
+        if self.jobs.stopping.is_set():
+            return
         if self.timeline is not None and self.timeline.interacting:
             self.render_pending = True
             return
+        app = Qt.QApplication.instance()
+        if app.activePopupWidget() or app.activeModalWidget():
+            # Keep view widgets alive until menus and dialogs unwind their event loops.
+            self.render_timer.start()
+            return
+        self.render_pending = False
         days = self.window_days()
         if self.mode == "Week":
             first, last = days[0], days[-1]
@@ -1264,7 +1263,7 @@ class CalendarWindow(Qt.QMainWindow):
             else:
                 self.refresh()
 
-        self.work(lambda: store.resize(event, start, end), done)
+        self.work(lambda: store.resize(event, start, end), done, cancel_on_close=False)
 
     def open_editor(self, event=None, selection=None):
         if not self.store:
@@ -1272,7 +1271,9 @@ class CalendarWindow(Qt.QMainWindow):
             return
         choices = (event.calendar,) if event else self.writable_calendars()
         try:
-            Editor(self, event, choices, selection).exec()
+            editor = Editor(self, event, choices, selection)
+            editor.exec()
+            editor.deleteLater()
         except CalendarError as error:
             self.set_status(str(error), "error")
 
@@ -1346,8 +1347,8 @@ def demo(window):
     window.store, window.calendars = DemoStore(), sample
     window.is_demo = True
     window.account.hide()
+    window.history.open("calendar-demo", start_import=False)
     window.refresh()
-    window.history.open("calendar-demo")
 
 
 def main():
@@ -1358,10 +1359,8 @@ def main():
     app = Qt.QApplication([APP_ID, "-name", APP_ID])
     app.setDesktopFileName(APP_ID)
     app.setApplicationDisplayName("Calendar")
-    pixmap = QtGui.QPixmap()
     try:
-        if pixmap.loadFromData(icon_png()):
-            app.setWindowIcon(QtGui.QIcon(pixmap))
+        app.setWindowIcon(window_icon())
     except (OSError, ValueError):
         pass
     breeze = next((style for style in Qt.QStyleFactory.keys() if style.lower() == "breeze"), None)

@@ -34,7 +34,7 @@ Scripts/run-linux --demo
 Scripts/run-linux
 ```
 
-Setup registers Calendar with its icon in the desktop app menu. You can also start it with `Scripts/run-linux`. Demo uses sample data in memory. A connection to Apple is only needed for the live calendar view.
+Setup registers Calendar in the desktop app menu with 256px and 512px icons. If an older install shows a generic icon, rerun `Scripts/setup-linux` and reopen Calendar from the app menu. You can also start it with `Scripts/run-linux`. Demo uses sample data in memory. A connection to Apple is only needed for the live calendar view.
 
 ## Updates
 

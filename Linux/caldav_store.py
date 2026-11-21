@@ -124,12 +124,15 @@ def occurrences(calendar, href, etag, raw, start, end, zone):
 
 
 class ICloudStore:
-    def __init__(self, username, password):
+    def __init__(self, username, password, *, stop_reads=None):
         self.credentials = (username, password)
+        self.stop_reads = stop_reads
 
     def request(self, method, url, body=None, headers=None):
         target = cloud_url(ROOT, url)
         for _ in range(6):
+            if method in ("PROPFIND", "REPORT") and self.stop_reads and self.stop_reads.is_set():
+                raise CalendarError("Calendar loading was cancelled.")
             try:
                 response = requests.request(
                     method, target, auth=self.credentials, data=body, headers=headers,

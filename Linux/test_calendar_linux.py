@@ -1,7 +1,9 @@
 """Disposable CalDAV fixtures and desktop smoke coverage."""
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from threading import Event as Gate, Lock
+from time import monotonic
 import unittest
 from unittest.mock import patch
 
@@ -105,11 +107,35 @@ class StoreTests(unittest.TestCase):
                 ICloudStore("demo@example.invalid", "fixture").request("PUT", HREF)
 
 
+    def test_shutdown_cancels_reads_before_request_or_redirect(self):
+        stop = Gate()
+        store = ICloudStore("demo@example.invalid", "fixture", stop_reads=stop)
+        with patch("caldav_store.requests.request") as request:
+            stop.set()
+            with self.assertRaisesRegex(CalendarError, "loading was cancelled"):
+                store.discover()
+            request.assert_not_called()
+            stop.clear()
+
+            def redirect(*args, **kwargs):
+                response = requests.Response()
+                response.status_code = 301
+                response.headers["Location"] = CAL.url
+                stop.set()
+                return response
+
+            request.side_effect = redirect
+            with self.assertRaisesRegex(CalendarError, "loading was cancelled"):
+                store.events(CAL, START, END, ZONE)
+            self.assertEqual(request.call_count, 1)
+
+
 class InstallTests(unittest.TestCase):
     def test_desktop_identity_uses_the_calendar_icon_and_installed_revision(self):
         from pathlib import Path
         from tempfile import TemporaryDirectory
-        from calendar_install import APP_ID, ROOT, icon_png, install, installed_revision
+        from PySide6.QtGui import QImage
+        from calendar_install import APP_ID, ROOT, icon_file, install, installed_revision
 
         with TemporaryDirectory() as folder:
             root = Path(folder) / 'Sample % calendar'
@@ -123,8 +149,11 @@ class InstallTests(unittest.TestCase):
             self.assertIn("Name=Calendar\n", launcher)
             self.assertIn(f"StartupWMClass={APP_ID}\n", launcher)
             self.assertIn("Sample %% calendar/Scripts/run-linux", launcher)
-            png = home / f"icons/hicolor/1024x1024/apps/{APP_ID}.png"
-            self.assertEqual(png.read_bytes(), icon_png())
+            for size in (256, 512):
+                image = QImage(str(icon_file(home, size)))
+                self.assertEqual((image.width(), image.height()), (size, size))
+            self.assertIn(f"Icon={icon_file(home, 512)}\n", launcher)
+            self.assertFalse(icon_file(home, 1024).exists())
             self.assertEqual(installed_revision(root), "a" * 40)
 
     def test_clean_checkout_fast_forwards_and_dirty_checkout_is_preserved(self):
@@ -164,8 +193,182 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(git(checkout, "rev-parse", "HEAD"), revision)
 
 
+def wait_for(condition, timeout=5):
+    from PySide6.QtTest import QTest
+
+    deadline = monotonic() + timeout
+    while not condition() and monotonic() < deadline:
+        QTest.qWait(15)
+    return condition()
+
+
+class SlowCalendarStore:
+    def __init__(self, stop_reads):
+        self.stop_reads = stop_reads
+        self.discovery = Gate()
+        self.history = Gate()
+        self.visible = Gate()
+        self.lock = Lock()
+        self.active = {"discovery": 0, "visible": 0, "history": 0}
+        self.calendars = [
+            Calendar(f"https://caldav.icloud.com/fixture-{i}/", f"Calendar {i}", "#4180b9", True)
+            for i in range(15)
+        ]
+
+    def busy(self, name):
+        with self.lock:
+            return self.active[name] > 0
+
+    def wait(self, gate, name):
+        with self.lock:
+            self.active[name] += 1
+        try:
+            # Simulate an HTTP request already on the wire when the window closes.
+            return gate.wait(5) and not self.stop_reads.is_set()
+        finally:
+            with self.lock:
+                self.active[name] -= 1
+
+    def discover(self):
+        self.wait(self.discovery, "discovery")
+        return self.calendars
+
+    def events(self, calendar, start, end, zone):
+        historical = (end - start).days >= 100
+        gate, name = (self.history, "history") if historical else (self.visible, "visible")
+        if not self.wait(gate, name):
+            return []
+        from caldav_store import Event
+
+        count = 2 if calendar is self.calendars[-2] else 4
+        stamp = datetime.combine(START.date(), START.time(), zone)
+        if historical:
+            stamp -= timedelta(days=10)
+        return [Event(f"{calendar.url}{index}", calendar, "", "", f"Fixture event {index}",
+                      stamp + timedelta(hours=index), stamp + timedelta(hours=index + 1),
+                      False, "", b"", False) for index in range(count)]
+
+
 @unittest.skipUnless(os.environ.get("CALENDAR_CORE_TEST_BIN"), "requires the built Swift helper")
 class DesktopTests(unittest.TestCase):
+    def fixture_window(self, file):
+        from PySide6 import QtCore, QtWidgets
+        from calendar_app import CalendarWindow, Core, ZONE
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        prefs = QtCore.QSettings(str(file), QtCore.QSettings.Format.IniFormat)
+        window = CalendarWindow(Core(os.environ["CALENDAR_CORE_TEST_BIN"]),
+                                clock=lambda: datetime(2026, 11, 21, 13, tzinfo=ZONE), settings=prefs)
+        window.show()
+        return app, window
+
+    def interact_during_load(self, window):
+        from PySide6 import QtCore, QtTest, QtWidgets
+
+        for button in (window.views.button(id) for id in (1, 2, 3, 1, 2)):
+            QtTest.QTest.mouseClick(button, QtCore.Qt.MouseButton.LeftButton)
+            QtTest.QTest.qWait(5)
+
+        def close_popup():
+            for menu in window.findChildren(QtWidgets.QMenu):
+                if menu.isVisible():
+                    menu.close()
+
+        def close_dialog():
+            modal = QtWidgets.QApplication.activeModalWidget()
+            if modal:
+                modal.reject()
+
+        QtCore.QTimer.singleShot(30, close_popup)
+        window.open_menu()
+        QtCore.QTimer.singleShot(30, close_dialog)
+        window.open_settings()
+
+    def test_close_window_during_account_discovery(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as folder:
+            app, window = self.fixture_window(Path(folder) / "discovery.ini")
+            store = SlowCalendarStore(window.jobs.stopping)
+            try:
+                with patch("calendar_app.ICloudStore", return_value=store):
+                    window.connect_account("demo@example.invalid", "fixture", remember=False)
+                self.assertTrue(wait_for(lambda: store.busy("discovery")))
+                self.interact_during_load(window)
+                self.assertTrue(store.busy("discovery"))
+                window.close()
+                self.assertFalse(window.isVisible())
+                self.assertTrue(store.busy("discovery"))
+                store.discovery.set()
+                self.assertTrue(wait_for(lambda: not store.busy("discovery")))
+                app.processEvents()
+                self.assertIsNone(window.store)
+                self.assertFalse(window.jobs.busy)
+            finally:
+                store.discovery.set()
+                window.close()
+
+    def test_interact_then_close_during_calendar_refresh_and_history_import(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as folder:
+            app, window = self.fixture_window(Path(folder) / "refresh.ini")
+            store = SlowCalendarStore(window.jobs.stopping)
+            window.settings.setValue("hiddenCalendars", [store.calendars[-1].url])
+            try:
+                store.discovery.set()
+                with patch("calendar_app.ICloudStore", return_value=store):
+                    window.connect_account("demo@example.invalid", "fixture", remember=False)
+                self.assertTrue(wait_for(lambda: store.busy("visible")))
+                self.assertFalse(store.busy("history"))
+                self.interact_during_load(window)
+                self.assertFalse(store.busy("history"))
+
+                from PySide6 import QtCore, QtWidgets
+
+                previous_view = window.timeline
+                rendered_during_dialog = []
+                deadline = monotonic() + 3
+
+                def close_after_visible_result():
+                    if len(window.events) != 54 and monotonic() < deadline:
+                        QtCore.QTimer.singleShot(20, close_after_visible_result)
+                        return
+                    rendered_during_dialog.append(window.timeline is not previous_view)
+                    modal = QtWidgets.QApplication.activeModalWidget()
+                    if modal:
+                        modal.reject()
+
+                QtCore.QTimer.singleShot(25, store.visible.set)
+                QtCore.QTimer.singleShot(60, close_after_visible_result)
+                window.open_settings()
+                self.assertEqual(rendered_during_dialog, [False])
+                self.assertTrue(wait_for(lambda: store.busy("history")))
+                self.assertTrue(wait_for(lambda: window.timeline is not previous_view))
+                self.assertEqual(len(window.calendars), 15)
+                self.assertEqual(len(window.events), 54)
+                self.assertIn("14 calendars", window.status.text())
+
+                store.visible.clear()
+                self.interact_during_load(window)
+                self.assertTrue(wait_for(lambda: store.busy("visible") and store.busy("history")))
+                window.close()
+                self.assertFalse(window.isVisible())
+                self.assertTrue(store.busy("visible") and store.busy("history"))
+                before = window.events
+                store.visible.set()
+                store.history.set()
+                self.assertTrue(wait_for(lambda: not store.busy("visible") and not store.busy("history")))
+                app.processEvents()
+                self.assertIs(window.events, before)
+                self.assertFalse(window.jobs.busy)
+            finally:
+                for gate in (store.discovery, store.visible, store.history):
+                    gate.set()
+                window.close()
+
     def test_demo_and_shared_quick_entry(self):
         from PySide6 import QtCore, QtTest, QtWidgets
         from calendar_app import CalendarWindow, Core, Editor, ZONE, demo
@@ -198,7 +401,7 @@ class DesktopTests(unittest.TestCase):
         demo(window)
 
         def settle():
-            self.assertTrue(window.pool.waitForDone(5000))
+            self.assertTrue(wait_for(lambda: not window.jobs.busy))
             app.processEvents()
 
         settle()
