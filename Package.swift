@@ -10,7 +10,9 @@ let package = Package(
     targets: [
         .systemLibrary(name: "CLinuxCrypto", pkgConfig: "libcrypto", providers: [.apt(["libssl-dev"])]),
         .target(name: "CalendarCore", dependencies: ["CLinuxCrypto"]),
-        .executableTarget(name: "CalendarLinuxBridge", dependencies: ["CalendarCore"]),
+        .target(name: "CalendarData", dependencies: ["CalendarCore"],
+                exclude: ["EventKitCalendarStore.swift", "GoogleTasks.swift"]),
+        .executableTarget(name: "CalendarLinuxBridge", dependencies: ["CalendarCore", "CalendarData"]),
         .testTarget(name: "CalendarCoreTests", dependencies: ["CalendarCore"]),
     ]
 )

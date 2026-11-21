@@ -46,7 +46,7 @@ def kde_color(settings, key, fallback):
 
 
 class DesktopStyle:
-    def __init__(self, appearance):
+    def __init__(self, appearance, accent=""):
         app = Qt.QApplication.instance()
         kde = kde_colors() if appearance == "System" else None
         native_dark = app.styleHints().colorScheme() == QtCore.Qt.ColorScheme.Dark
@@ -61,7 +61,8 @@ class DesktopStyle:
         self.grid = mix(self.text, self.surface, 0.095)
         self.hover = mix(self.text, self.panel, 0.08)
         self.weekend = mix(self.panel, self.surface, 0.58)
-        self.accent = kde_color(kde, "Colors:Selection/BackgroundNormal", "#62c9fa" if dark else "#0077aa")
+        self.accent = (QtGui.QColor(accent).name() if QtGui.QColor(accent).isValid()
+                       else kde_color(kde, "Colors:Selection/BackgroundNormal", "#62c9fa" if dark else "#0077aa"))
         self.on_accent = max(("#101820", "#ffffff"), key=lambda value: contrast(value, self.accent))
         self.selection = mix(self.accent, self.panel, 0.20 if dark else 0.12)
         self.accent_text = self.accent
@@ -142,12 +143,16 @@ class DesktopStyle:
             QPushButton[eventCard="true"][compact="true"] {{ min-height: 25px; max-height: 25px; }}
             QCheckBox {{ color: {self.text}; spacing: 8px; padding: 5px 2px; }}
             QCheckBox:focus {{ outline: 1px solid {accent}; }}
-            QLineEdit, QPlainTextEdit, QComboBox, QDateTimeEdit {{
+            QLineEdit, QPlainTextEdit, QComboBox, QDateTimeEdit, QSpinBox, QListWidget {{
                 background: {self.surface}; color: {self.text}; border: 1px solid {self.border}; border-radius: 7px; padding: 7px 9px;
                 selection-background-color: {accent}; selection-color: {self.on_accent};
             }}
             QComboBox, QDateTimeEdit {{ padding-right: 22px; }}
-            QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QDateTimeEdit:focus {{ border-color: {accent}; }}
+            QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QDateTimeEdit:focus, QSpinBox:focus {{ border-color: {accent}; }}
+            QWidget::item:selected {{ background: {self.selection}; color: {self.text}; }}
+            QTabWidget::pane {{ border: 1px solid {self.border}; border-radius: 7px; background: {self.panel}; }}
+            QTabBar::tab {{ background: {self.panel}; color: {self.muted}; padding: 8px 12px; }}
+            QTabBar::tab:selected {{ background: {self.selection}; color: {self.accent_text}; }}
             QMenu {{ background: {self.panel}; border: 1px solid {self.border}; padding: 4px; }}
             QMenu::item {{ padding: 6px 24px 6px 20px; border-radius: 4px; }}
             QMenu::item:selected {{ background: {self.selection}; color: {self.text}; }}
@@ -163,7 +168,7 @@ class DesktopStyle:
 THEME_ICONS = {
     "panel": "sidebar-show", "back": "go-previous", "next": "go-next",
     "add": "list-add", "refresh": "view-refresh",
-    "calendar": "view-calendar", "menu": "application-menu",
+    "calendar": "view-calendar", "menu": "application-menu", "settings": "configure",
 }
 
 
@@ -198,6 +203,14 @@ def icon(name, color, size=18):
         p.drawLine(3, 7, 15, 7)
         p.drawLine(6, 2, 6, 5)
         p.drawLine(12, 2, 12, 5)
+    elif name == "settings":
+        center = QtCore.QPointF(9, 9)
+        p.drawEllipse(center, 5, 5)
+        p.drawEllipse(center, 1.7, 1.7)
+        for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0),
+                       (0.707, 0.707), (-0.707, 0.707), (0.707, -0.707), (-0.707, -0.707)):
+            p.drawLine(QtCore.QPointF(9 + 5.2 * dx, 9 + 5.2 * dy),
+                       QtCore.QPointF(9 + 7 * dx, 9 + 7 * dy))
     elif name == "menu":
         for y in (5, 9, 13):
             p.drawLine(3, y, 15, y)

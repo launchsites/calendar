@@ -6,6 +6,18 @@ The Linux preview uses the same Swift quick-entry parser, time-around-event note
 
 Open the window menu and choose **Appearance**. System uses your Plasma colours and accent when KDE's colour configuration is available. Light and Dark can also be selected manually. The navigator button hides the mini month and calendar list for a full-width timeline. Narrow windows tuck the navigator away automatically. **Visible calendars** is also available from the window menu.
 
+## Drag to create and time around events
+
+In Day or Week, press on an empty part of a day column and drag up or down. Release to open an event draft with those times. Save the draft to create the event. Dragging snaps to 15 minutes by default, and the interval is configurable under **Settings → Display**.
+
+Choose **Add time before** or **Add time after** in an event to set its duration, purpose, travel mode and optional label. The dotted portions are drawn as part of the same card, without changing the event’s start or end. Hover over a compact card to see the full timing details. **Settings → Before & After** controls defaults for each side, the fill and whether time around an event should blend into another event.
+
+## Profiles and settings
+
+Open the **Settings** gear or press Ctrl+Comma. Profiles keep their own selection and ordering of calendars and can have their own accent. Switch profiles from the sidebar or window menu. **All calendars** restores your regular visibility settings. Profiles and preferences are stored locally on Linux.
+
+Display settings include the week start, time format, day layout, hour height and all-day visibility. Quick Entry settings control the default mode, duration and destination calendar.
+
 ## Run from source
 
 Install [Swift 6 or newer](https://www.swift.org/install/linux/), Python 3.11 or newer, `pkg-config`, and the OpenSSL development headers. On Debian 12, the package names for the additional dependencies are:
@@ -22,7 +34,7 @@ Scripts/run-linux --demo
 Scripts/run-linux
 ```
 
-Demo uses sample data in memory. A connection to Apple is only needed for the live calendar view.
+Run `Scripts/setup-linux` again after updating to rebuild the shared engine. Demo uses sample data in memory. A connection to Apple is only needed for the live calendar view.
 
 ## Connect iCloud
 
@@ -34,8 +46,8 @@ The app can remember the password in the Linux Secret Service keyring (for examp
 
 ## Preview limits
 
-Calendars stored in iCloud are available. Other Apple Calendar accounts and “On My Mac” calendars require their own provider connections or migration to iCloud. Google Tasks, Apple-side profiles and settings syncing, offline edits, drag resizing and undo are outside this preview.
+Calendars stored in iCloud are available. Other Apple Calendar accounts and “On My Mac” calendars require their own provider connections or migration to iCloud. Google Tasks, cross-device profile and settings sync, offline edits, moving or resizing saved events by dragging, and undo are outside this preview.
 
-Open single events to edit their title, time, and description. The preview renders recurring events and supports creating a weekly repeat, with existing series and invitations read-only. Linked Apple app copies are kept read-only while their round-trip behaviour is tested. Colour categories and per-profile styling still need a Linux UI. The event notes keep the Apple app’s before/after metadata. Updates and deletions require the version of the event you originally opened, so the app can reject a stale change.
+Open single events to edit their title, time, and description. The preview renders recurring events and supports creating a weekly repeat, with existing series and invitations read-only. Linked Apple app copies are kept read-only while their round-trip behaviour is tested. Event colour categories still need a Linux UI. The event notes keep the Apple app’s before/after metadata. Updates and deletions require the version of the event you originally opened, so the app can reject a stale change.
 
 Backend and desktop checks use disposable fixtures. Live account behaviour still needs verification against a disposable iCloud calendar.

@@ -94,9 +94,11 @@ class StoreTests(unittest.TestCase):
 @unittest.skipUnless(os.environ.get("CALENDAR_CORE_TEST_BIN"), "requires the built Swift helper")
 class DesktopTests(unittest.TestCase):
     def test_demo_and_shared_quick_entry(self):
-        from PySide6 import QtTest, QtWidgets
+        from PySide6 import QtCore, QtTest, QtWidgets
         from calendar_app import CalendarWindow, Core, Editor, ZONE, demo
         from desktop_style import DesktopStyle, contrast
+        from calendar_settings import Buffer, Preferences, Profile, SettingsDialog
+        from calendar_timeline import TRACK_PAD
 
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
         app.setOrganizationName("CalendarFixture")
@@ -116,8 +118,8 @@ class DesktopTests(unittest.TestCase):
                 self.assertEqual(system.accent, "#3daee9")
                 self.assertGreaterEqual(contrast(system.accent, system.on_accent), 4.5)
         fixed_now = datetime(2026, 11, 21, 13, 42, tzinfo=ZONE)
+        QtCore.QSettings().clear()
         window = CalendarWindow(core, clock=lambda: fixed_now)
-        window.settings.clear()
         window.set_appearance("Dark")
         window.show()
         demo(window)
@@ -160,13 +162,83 @@ class DesktopTests(unittest.TestCase):
         editor.parse()
         self.assertEqual(editor.title.text(), "Equipment check")
         self.assertEqual(editor.end.dateTime().toSecsSinceEpoch() - editor.start.dateTime().toSecsSinceEpoch(), 300)
-        self.assertIn("[Before: 11 minutes]", editor.raw_notes)
-        self.assertIn("[After: 5 minutes]", editor.raw_notes)
+        self.assertEqual(editor.buffers["before"], Buffer(11))
+        self.assertEqual(editor.buffers["after"], Buffer(5))
         self.assertEqual(editor.calendar.currentData().title, "Work")
+        editor.notes.setPlainText("Fixture description")
+        editor.buffers["after"] = Buffer(17, "Travel", "Train", "Return trip")
         editor.save()
         settle()
         settle()
-        self.assertTrue(any(event.title == "Equipment check" for event in window.events))
+        saved = next(event for event in window.events if event.title == "Equipment check")
+        activity = core.call("activity", notes=saved.notes)
+        self.assertEqual(activity["after"]["travelMode"], "Train")
+        self.assertEqual(activity["after"]["label"], "Return trip")
+        self.assertEqual(activity["description"], "Fixture description")
+        self.assertEqual(saved.end.timestamp() - saved.start.timestamp(), 300)
+        track = window.timeline.track[0]
+        card = next(card for card in track["cards"] if card["id"] == saved.key)
+        self.assertEqual(card["before"]["minutes"], 11)
+        self.assertGreaterEqual(card["coreTop"], 20)
+        self.assertGreater(card["height"], card["coreBottom"])
+        reopened = Editor(window, saved, calendars=(saved.calendar,))
+        self.assertEqual(reopened.buffers["after"], Buffer(17, "Travel", "Train", "Return trip"))
+        reopened.close()
+
+        note = core.call("saveActivity", notes="", description="Fixture",
+                         buffers={"before": {"minutes": 20, "kind": "Travel",
+                                             "travelMode": "Walking", "label": ""}, "after": None})
+        base = fixed_now.replace(hour=9, minute=0).timestamp()
+        cases = [{"id": "core", "start": base, "end": base + 1200},
+                 {"id": "with-travel", "start": base + 1800, "end": base + 3600, "notes": note}]
+        track, = core.call("layout", days=[base], items=cases, blend=True, pointsPerHour=60)
+        core_card = next(item for item in track["cards"] if item["id"] == "core")
+        self.assertEqual(core_card["trailing"], 1)
+        self.assertEqual(core_card["markers"], [{"owner": "with-travel", "start": 10, "end": 20}])
+
+        settings = SettingsDialog(window)
+        membership = [window.calendars[3].url, window.calendars[0].url]
+        settings.values.profiles.append(Profile("focus", "Focus", membership, "#8261e6"))
+        settings.update_profiles("focus")
+        settings.snap.setCurrentIndex(settings.snap.findData(30))
+        settings.before.minutes.setValue(12)
+        settings.accept()
+        settle()
+        self.assertEqual(window.look.accent, "#8261e6")
+        self.assertEqual([item.url for item in window.writable_calendars()], membership)
+        self.assertEqual(Preferences.load(window.settings).before.minutes, 12)
+        self.assertTrue(all(event.calendar.url in membership for event in window.events))
+        window.select_profile("")
+        settle()
+        self.assertEqual(len(window.writable_calendars()), 4)
+
+        captures = []
+
+        def receive(event=None, selection=None):
+            self.assertIsNone(event)
+            draft = Editor(window, calendars=window.writable_calendars(), selection=selection)
+            captures.append((draft.start.dateTime().toSecsSinceEpoch(), draft.end.dateTime().toSecsSinceEpoch()))
+            draft.close()
+
+        with patch.object(window, "open_editor", side_effect=receive):
+            for mode, column in (("Day", 0), ("Week", 0)):
+                window.change_view(mode)
+                settle()
+                timeline = window.timeline
+                bar = timeline.area.verticalScrollBar()
+                ruler = timeline.track[column]["snap"]
+                first, last = ruler[32], ruler[34]
+                bar.setValue(round(first["top"]) - 45)
+                QtTest.QTest.qWait(30)
+                x = (timeline.x(column) + timeline.x(column + 1)) // 2
+                a, b = (QtCore.QPoint(x, round(point["top"]) + TRACK_PAD) for point in (first, last))
+                QtTest.QTest.mousePress(timeline, QtCore.Qt.MouseButton.LeftButton, pos=b)
+                QtTest.QTest.mouseMove(timeline, a, delay=30)
+                QtTest.QTest.mouseRelease(timeline, QtCore.Qt.MouseButton.LeftButton, pos=a)
+                QtTest.QTest.qWait(50)
+                self.assertEqual(captures[-1], (int(first["time"]), int(last["time"])))
+            self.assertEqual(len(captures), 2)
+
         window.render()
         app.processEvents()
         screenshot = os.environ.get("CALENDAR_FIXTURE_SCREENSHOT")
@@ -185,6 +257,12 @@ class DesktopTests(unittest.TestCase):
             app.processEvents()
             self.assertTrue(editor.grab().save(str(output / "editor-dark.png")))
             editor.close()
+            options = SettingsDialog(window)
+            options.tabs.setCurrentIndex(2)
+            options.show()
+            app.processEvents()
+            self.assertTrue(options.grab().save(str(output / "timing-settings.png")))
+            options.close()
             window.resize(740, 510)
             window.change_view("Week")
             settle()

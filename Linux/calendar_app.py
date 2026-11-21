@@ -1,6 +1,7 @@
 """Calendar's Linux desktop window."""
 
 import argparse
+from dataclasses import asdict
 from concurrent.futures import ThreadPoolExecutor
 import json
 from datetime import date, datetime, time, timedelta
@@ -15,7 +16,9 @@ from PySide6 import QtCore, QtGui, QtWidgets as Qt
 from tzlocal import get_localzone
 
 from caldav_store import Calendar, CalendarError, Draft, Event, ICloudStore, local_time
-from desktop_style import CheckBox, DesktopStyle, EventButton, button, icon, label, mix
+from desktop_style import CheckBox, DesktopStyle, EventButton, button, icon, label
+from calendar_settings import Buffer, Preferences, SettingsDialog, edit_buffer
+from calendar_timeline import GUTTER, SCROLLBAR, Timeline
 
 
 ZONE = get_localzone()
@@ -70,9 +73,11 @@ class Worker(QtCore.QRunnable):
 
 
 class Editor(Qt.QDialog):
-    def __init__(self, window, event=None, calendars=()):
+    def __init__(self, window, event=None, calendars=(), selection=None):
         super().__init__(window)
         self.owner, self.original = window, event
+        self.selection = selection
+        self.preferences = window.preferences
         caption = "Event details" if event else "New event"
         self.setWindowTitle(caption)
         self.resize(520, 395)
@@ -86,6 +91,7 @@ class Editor(Qt.QDialog):
             self.mode = Qt.QComboBox()
             self.mode.addItem("Schedule ahead", "schedule")
             self.mode.addItem("Log activity", "log")
+            self.mode.setCurrentIndex(self.mode.findData(self.preferences.entry_mode))
             parse = button("Apply", "secondary")
             parse.clicked.connect(self.parse)
             row = Qt.QHBoxLayout()
@@ -98,8 +104,8 @@ class Editor(Qt.QDialog):
         self.start, self.end = Qt.QDateTimeEdit(), Qt.QDateTimeEdit()
         now = window.now()
         slot = midnight(window.day) + timedelta(hours=now.hour if window.day == now.date() else 9)
-        self.set_times(event.start if event else slot, event.end if event else slot + timedelta(hours=1),
-                       event.all_day if event else False)
+        start, end = selection or (slot, slot + timedelta(minutes=self.preferences.duration))
+        self.set_times(event.start if event else start, event.end if event else end, event.all_day if event else False)
         for editor in (self.start, self.end):
             editor.setCalendarPopup(True)
         self.all_day.toggled.connect(self.update_format)
@@ -109,12 +115,24 @@ class Editor(Qt.QDialog):
             self.calendar.addItem("Choose a calendar", None)
         for calendar in calendars:
             self.calendar.addItem(calendar.title, calendar)
+            if not event and calendar.url == self.preferences.default_calendar:
+                self.calendar.setCurrentIndex(self.calendar.count() - 1)
         self.notes = Qt.QPlainTextEdit()
         self.notes.setTabChangesFocus(True)
         self.notes.setPlaceholderText("Add a description")
         self.raw_notes = event.notes if event else ""
-        self.initial_description = window.core.call("describe", notes=self.raw_notes)
-        self.notes.setPlainText(self.initial_description)
+        activity = window.core.call("activity", notes=self.raw_notes)
+        self.notes.setPlainText(activity["description"])
+        self.buffers = {side: Buffer(**activity[side]) if activity[side] else None for side in ("before", "after")}
+        self.buffer_buttons = {}
+        timing = Qt.QHBoxLayout()
+        for side in ("before", "after"):
+            control = button(variant="secondary")
+            control.clicked.connect(lambda checked=False, name=side: self.edit_activity(name))
+            self.buffer_buttons[side] = control
+            timing.addWidget(control, 1)
+        self.update_buffers()
+        self.all_day.toggled.connect(self.update_buffers)
         self.weekly = CheckBox("Repeat weekly")
         self.entry_zone = None
         self.status = Qt.QLabel(wordWrap=True)
@@ -125,6 +143,7 @@ class Editor(Qt.QDialog):
         if not event:
             form.addRow("", self.weekly)
         form.addRow("Calendar", self.calendar)
+        form.addRow("Time around event", timing)
         form.addRow("Description", self.notes)
         form.addRow(self.status)
 
@@ -146,14 +165,27 @@ class Editor(Qt.QDialog):
             self.status.setText("This event is read-only." if event else "Connect a writable calendar to save events.")
             self.title.setReadOnly(True)
             self.notes.setReadOnly(True)
-            for control in (self.calendar, self.all_day, self.start, self.end):
+            for control in (self.calendar, self.all_day, self.start, self.end, *self.buffer_buttons.values()):
                 control.setEnabled(False)
         form.addRow(self.buttons)
         if event:
             self.title.setFocus()
         else:
-            self.quick.setFocus()
+            (self.title if selection else self.quick).setFocus()
             self.quick.returnPressed.connect(self.parse)
+
+    def update_buffers(self):
+        for side, control in self.buffer_buttons.items():
+            value = self.buffers[side]
+            text = f"{side.capitalize()} · {value.summary()}" if value else f"+ Add time {side}"
+            control.setText(control.fontMetrics().elidedText(text, QtCore.Qt.TextElideMode.ElideRight, 168))
+            control.setAccessibleName(text)
+            control.setToolTip(text)
+            control.setEnabled(not self.all_day.isChecked())
+
+    def edit_activity(self, side):
+        self.buffers[side] = edit_buffer(self, side.capitalize(), self.buffers[side], getattr(self.preferences, side))
+        self.update_buffers()
 
     def set_times(self, start, end, all_day):
         self.start.setDateTime(QtCore.QDateTime.fromSecsSinceEpoch(round(start.timestamp())))
@@ -163,18 +195,30 @@ class Editor(Qt.QDialog):
     def update_format(self):
         all_day = self.all_day.isChecked()
         for editor in (self.start, self.end):
-            editor.setDisplayFormat("ddd d MMM yyyy" if all_day else "ddd d MMM yyyy  HH:mm")
+            time_format = "h:mm AP" if self.preferences.clock == "12-hour" else "HH:mm"
+            editor.setDisplayFormat("ddd d MMM yyyy" if all_day else "ddd d MMM yyyy  " + time_format)
         if all_day and self.end.date() <= self.start.date():
             self.end.setDate(self.start.date().addDays(1))
 
     def parse(self):
         try:
-            result = self.owner.core.call("parse", text=self.quick.text(), slot=self.start.dateTime().toSecsSinceEpoch(),
-                                           mode=self.mode.currentData())
+            slot = self.start.dateTime().toSecsSinceEpoch()
+            duration = self.preferences.duration
+            if self.selection:
+                duration = max(1, (self.end.dateTime().toSecsSinceEpoch() - slot) // 60)
+            result = self.owner.core.call("parse", text=self.quick.text(), slot=slot, now=self.owner.now().timestamp(),
+                                          duration=duration, mode=self.mode.currentData(),
+                                          beforeDefault=asdict(self.preferences.before),
+                                          afterDefault=asdict(self.preferences.after))
             self.title.setText(result["title"])
-            self.set_times(from_epoch(result["start"]), from_epoch(result["end"]), result["allDay"])
+            if not self.selection or result["explicitStart"] or result["explicitEnd"] or result["explicitDate"] or result["allDay"]:
+                self.set_times(from_epoch(result["start"]), from_epoch(result["end"]), result["allDay"])
             self.weekly.setChecked(result["repeatWeekly"])
-            self.raw_notes = result["notes"]
+            for side in ("before", "after"):
+                value = result["activity"][side]
+                if value:
+                    self.buffers[side] = Buffer(**value)
+            self.update_buffers()
             self.entry_zone = result["timeZone"]
             notice = result["notice"]
             requested = result["requestedCalendar"]
@@ -200,9 +244,10 @@ class Editor(Qt.QDialog):
         elif self.entry_zone:
             start, end = (value.astimezone(ZoneInfo(self.entry_zone)) for value in (start, end))
         try:
-            description = self.notes.toPlainText()
-            notes = self.raw_notes if description == self.initial_description else self.owner.core.call(
-                "replaceDescription", notes=self.raw_notes, description=description)
+            notes = self.owner.core.call(
+                "saveActivity", notes=self.raw_notes, description=self.notes.toPlainText(),
+                buffers={side: asdict(value) if value and not self.all_day.isChecked() else None
+                         for side, value in self.buffers.items()})
         except CalendarError as error:
             self.status.setText(str(error))
             return
@@ -242,122 +287,13 @@ class Editor(Qt.QDialog):
             super().reject()
 
 
-GUTTER = 58
-TRACK_PAD = 10
-SCROLLBAR = 10
-
-
-class Timeline(Qt.QWidget):
-    def __init__(self, owner, days, layout, events):
-        super().__init__()
-        self.owner, self.days, self.track = owner, days, layout
-        self.look = owner.look
-        self.today = owner.now().date()
-        by_key = {event.key: event for event in events}
-        self.setMinimumHeight(int(max(x["height"] for x in layout)) + TRACK_PAD * 2)
-        self.setSizePolicy(Qt.QSizePolicy.Policy.Expanding, Qt.QSizePolicy.Policy.Fixed)
-        self.cards = []
-        for column, data in enumerate(layout):
-            for card in data["cards"]:
-                event = by_key[card["id"]]
-                times = event.start.strftime("%H:%M") + " – " + event.end.strftime("%H:%M")
-                entry = EventButton(event, self.look, caption=times, parent=self)
-                entry.clicked.connect(lambda checked=False, item=event: self.owner.open_editor(item))
-                self.cards.append((column, card, entry))
-        self.buffers = [(i, band, by_key[band["id"]].calendar.color)
-                        for i, day in enumerate(layout) for band in day["buffers"]]
-        self.clock = NowMarker(self)
-        self.clock.raise_()
-
-    def x(self, column):
-        return round(GUTTER + column * (self.width() - GUTTER) / len(self.days))
-
-    def resizeEvent(self, event):
-        for column, card, entry in self.cards:
-            left = self.x(column + card["leading"]) + 4
-            right = self.x(column + card["trailing"]) - 4
-            entry.setGeometry(left, round(card["top"]) + TRACK_PAD + 1, max(1, right - left),
-                              max(1, round(card["height"]) - 2))
-        self.clock.setGeometry(self.rect())
-        super().resizeEvent(event)
-
-    def paintEvent(self, event):
-        p = QtGui.QPainter(self)
-        look = self.look
-        p.fillRect(event.rect(), QtGui.QColor(look.surface))
-        font = self.font()
-        font.setPixelSize(11)
-        p.setFont(font)
-        for column, (day, data) in enumerate(zip(self.days, self.track)):
-            left, right = self.x(column), self.x(column + 1)
-            if day == self.today:
-                p.fillRect(left, 0, right - left, self.height(), QtGui.QColor(look.today_column))
-            elif day.weekday() >= 5:
-                p.fillRect(left, 0, right - left, self.height(), QtGui.QColor(look.weekend))
-            p.setPen(QtGui.QColor(look.grid))
-            p.drawLine(left, 0, left, self.height())
-            for hour in data["hours"]:
-                y = round(hour["top"]) + TRACK_PAD
-                p.setPen(QtGui.QColor(look.grid))
-                p.drawLine(left, y, right, y)
-                if column == 0:
-                    p.setPen(QtGui.QColor(look.muted))
-                    p.drawText(QtCore.QRect(0, y - 9, GUTTER - 12, 18),
-                               QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter,
-                               from_epoch(hour["start"]).strftime("%H:%M"))
-        for column, band, color in self.buffers:
-            left, right = self.x(column) + 4, self.x(column + 1) - 4
-            y = round(band["top"]) + TRACK_PAD
-            height = round(band["height"])
-            if height <= 0:
-                continue
-            p.fillRect(left, y, max(1, right - left), height, QtGui.QColor(mix(color, look.surface, 0.12)))
-            p.setPen(QtGui.QPen(QtGui.QColor(color), 2, QtCore.Qt.PenStyle.DotLine))
-            p.drawLine(left + 4, y, left + 4, y + height)
-            if height >= 17:
-                p.setPen(QtGui.QColor(look.muted))
-                caption = p.fontMetrics().elidedText(band["label"], QtCore.Qt.TextElideMode.ElideRight,
-                                                     max(0, right - left - 17))
-                p.drawText(left + 11, y + 13, caption)
-
-
-class NowMarker(Qt.QWidget):
-    def __init__(self, timeline):
-        super().__init__(timeline)
-        self.timeline = timeline
-        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-
-    def paintEvent(self, event):
-        p = QtGui.QPainter(self)
-        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        look = self.timeline.look
-        accent = QtGui.QColor(look.accent)
-        for column, day in enumerate(self.timeline.track):
-            if day["now"] is None:
-                continue
-            y = round(day["now"]) + TRACK_PAD
-            left, right = self.timeline.x(column), self.timeline.x(column + 1)
-            p.setPen(QtGui.QPen(accent, 1.5))
-            p.drawLine(left, y, right, y)
-            p.setBrush(accent)
-            p.drawEllipse(QtCore.QPoint(left, y), 3, 3)
-            p.setPen(QtCore.Qt.PenStyle.NoPen)
-            p.drawRoundedRect(QtCore.QRectF(6, y - 9, GUTTER - 13, 18), 5, 5)
-            font = self.font()
-            font.setPixelSize(11)
-            font.setWeight(QtGui.QFont.Weight.DemiBold)
-            p.setFont(font)
-            p.setPen(QtGui.QColor(look.on_accent))
-            p.drawText(QtCore.QRect(6, y - 9, GUTTER - 13, 18), QtCore.Qt.AlignmentFlag.AlignCenter,
-                       self.timeline.owner.now().strftime("%H:%M"))
-
-
 class CalendarWindow(Qt.QMainWindow):
     def __init__(self, core, clock=None):
         super().__init__()
         self.core = core
         self.now = clock or (lambda: datetime.now(ZONE))
         self.settings = QtCore.QSettings()
+        self.preferences = Preferences.load(self.settings)
         self.pool = QtCore.QThreadPool(self)
         self.pool.setMaxThreadCount(2)
         self.workers = set()
@@ -366,6 +302,8 @@ class CalendarWindow(Qt.QMainWindow):
         self.store, self.calendars, self.events = None, [], []
         self.reading = False
         self.refresh_pending = False
+        self.render_pending = False
+        self.timeline = None
         self.snapshot = None
         self.connecting = False
         self.is_demo = False
@@ -460,10 +398,12 @@ class CalendarWindow(Qt.QMainWindow):
         self.add = button("New event", "primary", name="New event (Ctrl+N)")
         self.add.clicked.connect(lambda: self.open_editor())
         row.addWidget(self.add)
+        row.addWidget(self.icon_button("settings", "Settings (Ctrl+,)", self.open_settings))
         self.menu_button = self.icon_button("menu", "Calendar menu", self.open_menu)
         row.addWidget(self.menu_button)
         QtGui.QShortcut(QtGui.QKeySequence.StandardKey.New, self, activated=self.open_editor)
         QtGui.QShortcut(QtGui.QKeySequence("Ctrl+R"), self, activated=self.refresh)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+,"), self, activated=self.open_settings)
         return bar
 
     def build_navigator(self):
@@ -491,9 +431,10 @@ class CalendarWindow(Qt.QMainWindow):
         mini.setContentsMargins(0, 0, 0, 0)
         mini.setSpacing(2)
         self.mini_buttons = []
-        monday = date(2026, 1, 5)
+        self.mini_weekdays = []
         for weekday in range(7):
-            header = label((monday + timedelta(days=weekday)).strftime("%a")[:2], tone="muted", size=10)
+            header = label(tone="muted", size=10)
+            self.mini_weekdays.append(header)
             header.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             mini.addWidget(header, 0, weekday)
         for index in range(42):
@@ -508,7 +449,12 @@ class CalendarWindow(Qt.QMainWindow):
         line.setFixedHeight(1)
         box.addWidget(line)
         box.addSpacing(14)
-        box.addWidget(label("Calendars", size=13, weight=QtGui.QFont.Weight.DemiBold))
+        heading = Qt.QHBoxLayout()
+        heading.addWidget(label("Calendars", size=13, weight=QtGui.QFont.Weight.DemiBold), 1)
+        self.profile_button = button("Profiles", name="Switch calendar profile")
+        self.profile_button.clicked.connect(self.open_profiles)
+        heading.addWidget(self.profile_button)
+        box.addLayout(heading)
         box.addSpacing(5)
 
         self.source_list = Qt.QVBoxLayout()
@@ -563,7 +509,8 @@ class CalendarWindow(Qt.QMainWindow):
         self.update_bar_width(self.width())
 
     def apply_appearance(self):
-        self.look = DesktopStyle(self.appearance)
+        profile = self.preferences.active_profile
+        self.look = DesktopStyle(self.appearance, profile.accent if profile else "")
         self.look.apply(self)
         for item, glyph in self.icon_buttons:
             item.setIcon(icon(glyph, self.look.muted))
@@ -575,6 +522,9 @@ class CalendarWindow(Qt.QMainWindow):
 
     def open_menu(self):
         menu = Qt.QMenu(self)
+        settings = menu.addAction("Settings…")
+        settings.triggered.connect(self.open_settings)
+        self.fill_profile_menu(menu.addMenu("Profiles"))
         calendars = menu.addAction("Visible calendars…")
         calendars.triggered.connect(self.visibility)
         if not self.is_demo:
@@ -589,6 +539,32 @@ class CalendarWindow(Qt.QMainWindow):
             group.addAction(action)
             action.triggered.connect(lambda checked=False, mode=name: self.set_appearance(mode))
         menu.exec(self.menu_button.mapToGlobal(QtCore.QPoint(0, self.menu_button.height() + 4)))
+
+    def fill_profile_menu(self, menu):
+        group = QtGui.QActionGroup(menu)
+        items = [("All calendars", "")] + [(profile.name, profile.id) for profile in self.preferences.profiles]
+        for name, key in items:
+            select = menu.addAction(name)
+            select.setCheckable(True)
+            select.setChecked(self.preferences.current == key)
+            group.addAction(select)
+            select.triggered.connect(lambda checked=False, profile_id=key: self.select_profile(profile_id))
+
+    def open_profiles(self):
+        menu = Qt.QMenu(self)
+        self.fill_profile_menu(menu)
+        menu.addSeparator()
+        menu.addAction("Manage profiles…", self.open_settings)
+        menu.exec(self.profile_button.mapToGlobal(QtCore.QPoint(0, self.profile_button.height())))
+
+    def open_settings(self):
+        SettingsDialog(self).exec()
+
+    def select_profile(self, profile_id):
+        self.preferences.current = profile_id
+        self.preferences.store(self.settings)
+        self.apply_appearance()
+        self.refresh()
 
     def set_appearance(self, mode):
         self.appearance = mode
@@ -611,7 +587,9 @@ class CalendarWindow(Qt.QMainWindow):
     def update_mini(self):
         first = self.navigator_month
         self.mini_heading.setText(first.strftime("%B %Y"))
-        grid_start = first - timedelta(days=first.weekday())
+        grid_start = self.start_of_week(first)
+        for i, header in enumerate(self.mini_weekdays):
+            header.setText((grid_start + timedelta(days=i)).strftime("%a")[:2])
         today = self.now().date()
         days = self.window_days()
         active = set(days if self.mode == "Week" else [self.day])
@@ -628,7 +606,12 @@ class CalendarWindow(Qt.QMainWindow):
             item.style().polish(item)
 
     def update_calendar_list(self):
-        key = tuple(self.calendars)
+        active = self.preferences.active_profile
+        name = active.name if active else "Profiles"
+        self.profile_button.setText(self.profile_button.fontMetrics().elidedText(
+            name, QtCore.Qt.TextElideMode.ElideRight, 102))
+        self.profile_button.setToolTip(f"Switch calendar profile · {active.name}" if active else "Switch calendar profile")
+        key = tuple(self.ordered_calendars())
         hidden = self.hidden()
         if self.source_key != key:
             while self.source_list.count():
@@ -639,7 +622,7 @@ class CalendarWindow(Qt.QMainWindow):
             self.source_key = key
             if not key:
                 self.source_list.addWidget(label("No calendars connected", tone="muted", size=12))
-            for calendar in self.calendars:
+            for calendar in key:
                 toggle = CheckBox(calendar.title, color=calendar.color)
                 toggle.setToolTip(calendar.title)
                 toggle.toggled.connect(lambda shown, url=calendar.url: self.set_calendar_visible(url, shown))
@@ -655,8 +638,7 @@ class CalendarWindow(Qt.QMainWindow):
             hidden.discard(url)
         else:
             hidden.add(url)
-        self.settings.setValue("hiddenCalendars", sorted(hidden))
-        self.navigate()
+        self.save_visibility(hidden)
 
 
     def start(self):
@@ -680,16 +662,19 @@ class CalendarWindow(Qt.QMainWindow):
         worker.signals.done.connect(finish, QtCore.Qt.ConnectionType.QueuedConnection)
         self.pool.start(worker)
 
+    def start_of_week(self, day):
+        return day - timedelta(days=(day.weekday() - self.preferences.week_start) % 7)
+
     def window_days(self):
         if self.mode == "Day":
             return [self.day]
         if self.mode == "Week":
-            start = self.day - timedelta(days=self.day.weekday())
+            start = self.start_of_week(self.day)
             return [start + timedelta(days=i) for i in range(7)]
         first = self.day.replace(day=1)
         next_month = (first + timedelta(days=32)).replace(day=1)
-        start = first - timedelta(days=first.weekday())
-        stop = next_month + timedelta(days=(-next_month.weekday()) % 7)
+        start = self.start_of_week(first)
+        stop = next_month + timedelta(days=(self.preferences.week_start - next_month.weekday()) % 7)
         return [start + timedelta(days=i) for i in range((stop - start).days)]
 
     def advance(self, step):
@@ -776,7 +761,7 @@ class CalendarWindow(Qt.QMainWindow):
         form = Qt.QVBoxLayout(dialog)
         hidden = self.hidden()
         toggles = []
-        for calendar in self.calendars:
+        for calendar in self.ordered_calendars():
             toggle = CheckBox(calendar.title, color=calendar.color, checked=calendar.url not in hidden)
             toggles.append((calendar.url, toggle))
             form.addWidget(toggle)
@@ -788,10 +773,30 @@ class CalendarWindow(Qt.QMainWindow):
         buttons.rejected.connect(dialog.reject)
         form.addWidget(buttons)
         if dialog.exec():
-            self.settings.setValue("hiddenCalendars", [url for url, toggle in toggles if not toggle.isChecked()])
-            self.navigate()
+            self.save_visibility({url for url, toggle in toggles if not toggle.isChecked()})
+
+    def ordered_calendars(self):
+        profile = self.preferences.active_profile
+        if not profile:
+            return self.calendars
+        rank = {url: i for i, url in enumerate(profile.calendars)}
+        return sorted(self.calendars, key=lambda item: rank.get(item.url, len(rank)))
+
+    def save_visibility(self, hidden):
+        profile = self.preferences.active_profile
+        if profile:
+            known = {item.url for item in self.calendars}
+            visible = [item.url for item in self.ordered_calendars() if item.url not in hidden]
+            profile.calendars = visible + [url for url in profile.calendars if url not in known]
+            self.preferences.store(self.settings)
+        else:
+            self.settings.setValue("hiddenCalendars", sorted(hidden))
+        self.navigate()
 
     def hidden(self):
+        profile = self.preferences.active_profile
+        if profile:
+            return {item.url for item in self.calendars} - set(profile.calendars)
         return set(self.settings.value("hiddenCalendars", [], list))
 
     def refresh(self):
@@ -802,7 +807,8 @@ class CalendarWindow(Qt.QMainWindow):
             return
         self.reading = True
         days = self.window_days()
-        start, end = midnight(days[0]), midnight(days[-1] + timedelta(days=1))
+        pad = timedelta(days=1 if self.mode in ("Day", "Week") else 0)
+        start, end = midnight(days[0]) - pad, midnight(days[-1] + timedelta(days=1)) + pad
         visible = [item for item in self.calendars if item.url not in self.hidden()]
         store = self.store
         self.set_status("Refreshing calendars…", "working")
@@ -856,12 +862,16 @@ class CalendarWindow(Qt.QMainWindow):
                 (item.end > start or item.start >= start)]
 
     def clear_canvas(self):
+        self.timeline = None
         while self.canvas.count():
             widget = self.canvas.takeAt(0).widget()
             widget.hide()
             widget.deleteLater()
 
     def render(self):
+        if self.timeline is not None and self.timeline.drag_anchor is not None:
+            self.render_pending = True
+            return
         days = self.window_days()
         if self.mode == "Week":
             first, last = days[0], days[-1]
@@ -883,7 +893,9 @@ class CalendarWindow(Qt.QMainWindow):
                 self.set_status("No account connected")
             return
         hidden = self.hidden()
-        events = [item for item in self.events if item.calendar.url not in hidden]
+        events = [item for item in self.events if item.calendar.url not in hidden
+                  and (self.preferences.all_day.get(self.mode, True) if item.all_day
+                       else self.mode != "Month" or self.preferences.month_timed)]
         if self.mode == "Month":
             self.draw_month(days, events)
         else:
@@ -988,15 +1000,18 @@ class CalendarWindow(Qt.QMainWindow):
                     "notes": item.notes} for item in events if not item.all_day]
         try:
             layout = self.core.call("layout", days=[midnight(day).timestamp() for day in days],
-                                    items=payload, now=self.now().timestamp(), adaptive=self.mode == "Day",
-                                    pointsPerHour=64 if self.mode == "Week" else 72)
+                                    items=payload, now=self.now().timestamp(),
+                                    adaptive=self.mode == "Day" and self.preferences.adaptive,
+                                    pointsPerHour=self.preferences.hour_height,
+                                    snapMinutes=self.preferences.snap, blend=self.preferences.blend)
         except CalendarError as error:
             self.canvas.addWidget(label(str(error)), 1)
             return
         area = Qt.QScrollArea(widgetResizable=True)
         area.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        area.setWidget(Timeline(self, days, layout, events))
+        self.timeline = Timeline(self, days, layout, events, area)
+        area.setWidget(self.timeline)
         self.canvas.addWidget(area, 1)
         bar = area.verticalScrollBar()
         if getattr(self, "timeline_scroll", None) is None:
@@ -1039,7 +1054,7 @@ class CalendarWindow(Qt.QMainWindow):
             num.clicked.connect(lambda checked=False, d=day, e=items: self.preview(d, e))
             box.addWidget(num, alignment=QtCore.Qt.AlignmentFlag.AlignLeft)
             for item in items[:2]:
-                box.addWidget(self.event_button(item, "" if item.all_day else item.start.strftime("%H:%M")))
+                box.addWidget(self.event_button(item, "" if item.all_day else self.preferences.time_label(item.start)))
             if len(items) > 2:
                 more = button(f"+{len(items) - 2} more", "overflow")
                 more.clicked.connect(lambda checked=False, d=day, e=items: self.preview(d, e))
@@ -1070,7 +1085,7 @@ class CalendarWindow(Qt.QMainWindow):
         if not items:
             rows.addWidget(label("Nothing scheduled", tone="muted"))
         for item in items:
-            prefix = "All day" if item.all_day else item.start.strftime("%H:%M")
+            prefix = "All day" if item.all_day else self.preferences.time_label(item.start)
             rows.addWidget(self.event_button(item, prefix))
         rows.addStretch()
         area.setWidget(contents)
@@ -1081,13 +1096,17 @@ class CalendarWindow(Qt.QMainWindow):
         if dialog.exec():
             self.open_day(day)
 
-    def open_editor(self, event=None):
+    def writable_calendars(self):
+        hidden = self.hidden()
+        return tuple(item for item in self.ordered_calendars() if item.writable and item.url not in hidden)
+
+    def open_editor(self, event=None, selection=None):
         if not self.store:
             self.connect_dialog()
             return
-        choices = (event.calendar,) if event else tuple(c for c in self.calendars if c.writable and c.url not in self.hidden())
+        choices = (event.calendar,) if event else self.writable_calendars()
         try:
-            Editor(self, event, choices).exec()
+            Editor(self, event, choices, selection).exec()
         except CalendarError as error:
             self.set_status(str(error), "error")
 
@@ -1123,7 +1142,14 @@ def demo(window):
                 day = midnight(monday + timedelta(days=index))
                 for hour, minute, duration, calendar, title in entries:
                     start = day + timedelta(hours=hour, minutes=minute)
-                    self.save(sample[calendar], Draft(title, start, start + timedelta(minutes=duration), ""))
+                    notes = ""
+                    if title in ("Market", "Client preview"):
+                        notes = window.core.call(
+                            "saveActivity", notes="", description="",
+                            buffers={"before": asdict(Buffer(minutes=20)),
+                                     "after": asdict(Buffer(minutes=20, kind="Cleanup", travelMode="Unspecified"))},
+                        )
+                    self.save(sample[calendar], Draft(title, start, start + timedelta(minutes=duration), notes))
             friday = monday + timedelta(days=4)
             self.save(sample[0], Draft("Release day", friday, friday + timedelta(days=1), ""))
             self.save(sample[3], Draft("Weekend plans", friday + timedelta(days=1),
@@ -1163,7 +1189,7 @@ def main():
     breeze = next((style for style in Qt.QStyleFactory.keys() if style.lower() == "breeze"), None)
     app.setStyle(breeze or "Fusion")
     app.setOrganizationName("Stillday")
-    app.setApplicationName("Calendar")
+    app.setApplicationName("Calendar Demo" if options.demo else "Calendar")
     window = CalendarWindow(Core(str(options.core.resolve())))
     window.show()
     if options.demo:
