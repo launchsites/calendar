@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if [[ "$(uname -s)" != Linux ]]; then
+    echo "Run Scripts/setup-linux on Linux." >&2
+    exit 1
+fi
+
+if ! command -v swift >/dev/null || ! command -v pkg-config >/dev/null ||
+   ! pkg-config --exists libcrypto; then
+    echo "Install Swift 6+, pkg-config and the OpenSSL development headers first. See Linux/README.md." >&2
+    exit 1
+fi
+
+swift build -c release --product calendar-linux-core
+python3 -m venv .build/linux-venv
+.build/linux-venv/bin/python -m pip install -r Linux/requirements.txt
+printf '\nStart Calendar with Scripts/run-linux (or add --demo for sample events).\n'

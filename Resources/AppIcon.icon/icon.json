@@ -1,0 +1,21 @@
+{
+  "fill": {
+    "linear-gradient": [
+      "srgb:0.99608,0.98824,0.96863,1.00000",
+      "srgb:0.90196,0.92157,0.94902,1.00000"
+    ]
+  },
+  "groups": [
+    {
+      "layers": [
+        { "name": "Calendar header", "image-name": "calendar-rule.svg", "glass": true },
+        { "name": "Date number", "image-name": "calendar-date.svg", "glass": false }
+      ],
+      "lighting": "individual",
+      "translucency": { "enabled": false, "value": 0.5 }
+    }
+  ],
+  "supported-platforms": {
+    "squares": "shared"
+  }
+}

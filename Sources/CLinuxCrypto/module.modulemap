@@ -1,0 +1,5 @@
+module CLinuxCrypto [system] {
+    header "sha256.h"
+    link "crypto"
+    export *
+}

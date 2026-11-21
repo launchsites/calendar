@@ -1,0 +1,7 @@
+PySide6-Essentials>=6.8,<7
+defusedxml>=0.7,<1
+icalendar>=6.3,<7
+keyring>=25,<26
+recurring-ical-events>=3.6,<4
+requests>=2.32.4,<3
+tzlocal>=5.3,<6

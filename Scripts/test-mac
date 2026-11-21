@@ -1,0 +1,14 @@
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+mkdir -p .build/clang-cache
+export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-$PWD/.build/clang-cache}"
+developer_dir="$(xcode-select -p)"
+if [[ "$developer_dir" == */CommandLineTools ]]; then
+    swift test --manifest-cache local --disable-xctest \
+        -Xswiftc "-F$developer_dir/Library/Developer/Frameworks" \
+        -Xlinker -rpath -Xlinker "$developer_dir/Library/Developer/Frameworks" \
+        -Xlinker -rpath -Xlinker "$developer_dir/Library/Developer/usr/lib" "$@"
+else
+    swift test --manifest-cache local "$@"
+fi

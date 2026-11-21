@@ -1,0 +1,15 @@
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.DS_Store
+
+__pycache__/
+
+# Local credentials, signing artifacts and calendar exports
+.env
+.env.*
+*.mobileprovision
+*.p12
+*.ipa
+*.ics

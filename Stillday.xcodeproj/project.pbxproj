@@ -1,0 +1,49 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+		DA41ED1210B64FC29D5EBB11 /* GoogleTasksAccount.swift */ = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GoogleTasksAccount.swift; sourceTree = "<group>"; };
+		38D39E8B8BD94BA594E0C00A /* GoogleTasksAccount.swift in Sources */ = { isa = PBXBuildFile; fileRef = DA41ED1210B64FC29D5EBB11; };
+		86933B4B728F82EA01607146 /* CalendarModel.swift */ = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CalendarModel.swift; sourceTree = "<group>"; };
+		E64CE8B297812FD254158F2A /* CalendarModel.swift in Sources */ = { isa = PBXBuildFile; fileRef = 86933B4B728F82EA01607146; };
+		C6936763CC1D6DE6A4FFA82A /* CalendarScreen.swift */ = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CalendarScreen.swift; sourceTree = "<group>"; };
+		B469087712AEC4E99332C4BF /* CalendarScreen.swift in Sources */ = { isa = PBXBuildFile; fileRef = C6936763CC1D6DE6A4FFA82A; };
+		8C46A1FB0D08F5562A5EEA50 /* CalendarViews.swift */ = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CalendarViews.swift; sourceTree = "<group>"; };
+		4AD095A5EEC2830029A84AB3 /* CalendarViews.swift in Sources */ = { isa = PBXBuildFile; fileRef = 8C46A1FB0D08F5562A5EEA50; };
+		B507F4EE4EA4429651A341DB /* EventSheets.swift */ = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EventSheets.swift; sourceTree = "<group>"; };
+		59571197B1B7472EF84EAB51 /* EventSheets.swift in Sources */ = { isa = PBXBuildFile; fileRef = B507F4EE4EA4429651A341DB; };
+		63DD2A28E5D292A1AC846279 /* QuickEntryShortcut.swift */ = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickEntryShortcut.swift; sourceTree = "<group>"; };
+		57D3B85B4C7B8DF4FCD57F5E /* QuickEntryShortcut.swift in Sources */ = { isa = PBXBuildFile; fileRef = 63DD2A28E5D292A1AC846279; };
+		E0A86833D56F9695A89E9107 /* SettingsSheet.swift */ = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsSheet.swift; sourceTree = "<group>"; };
+		342A92EC6F3A659265D85980 /* SettingsSheet.swift in Sources */ = { isa = PBXBuildFile; fileRef = E0A86833D56F9695A89E9107; };
+		3F150772D15B783A615895FF /* StilldayApp.swift */ = { isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StilldayApp.swift; sourceTree = "<group>"; };
+		3F0A178DF10E312B9B27ABE8 /* StilldayApp.swift in Sources */ = { isa = PBXBuildFile; fileRef = 3F150772D15B783A615895FF; };
+		D59386E0AE435E292FBE0EBC /* AppIcon.icon */ = { isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = AppIcon.icon; sourceTree = "<group>"; };
+		9CEEC13202AFBF12EE3ABB99 /* Info.plist */ = { isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		7A8DFA9277654386CC0BC2F9 /* AppIcon.icon in Resources */ = { isa = PBXBuildFile; fileRef = D59386E0AE435E292FBE0EBC; };
+		A8792157CB4F27FB949C035F /* Stillday.app */ = { isa = PBXFileReference; explicitFileType = wrapper.application; path = Stillday.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		F7EBC87E12F52DB20EE60E65 /* App */ = { isa = PBXGroup; children = (86933B4B728F82EA01607146, C6936763CC1D6DE6A4FFA82A, 8C46A1FB0D08F5562A5EEA50, B507F4EE4EA4429651A341DB, 63DD2A28E5D292A1AC846279, E0A86833D56F9695A89E9107, 3F150772D15B783A615895FF, DA41ED1210B64FC29D5EBB11, ); name = App; path = Sources/Stillday; sourceTree = "<group>"; };
+		C91E46038CC50433D6EE5625 /* Resources */ = { isa = PBXGroup; children = (D59386E0AE435E292FBE0EBC, 9CEEC13202AFBF12EE3ABB99, ); path = Resources; sourceTree = "<group>"; };
+		0A3E27B8CA818264D75C8D81 /* Products */ = { isa = PBXGroup; children = (A8792157CB4F27FB949C035F,); name = Products; sourceTree = "<group>"; };
+		AD936FCBED631FA67E05C3EA /* Project */ = { isa = PBXGroup; children = (F7EBC87E12F52DB20EE60E65, C91E46038CC50433D6EE5625, 0A3E27B8CA818264D75C8D81, ); sourceTree = "<group>"; };
+		BC4A71180870F7945155FBB0 /* Local package */ = { isa = XCLocalSwiftPackageReference; relativePath = "."; };
+		EC3CE7EE7B06D78037034F1E /* CalendarCore */ = { isa = XCSwiftPackageProductDependency; package = BC4A71180870F7945155FBB0; productName = CalendarCore; };
+		B4D14C599949CE577823A45D /* CalendarCore in Frameworks */ = { isa = PBXBuildFile; productRef = EC3CE7EE7B06D78037034F1E; };
+		A8F4061E780EDDAD48CF4A14 /* CalendarData */ = { isa = XCSwiftPackageProductDependency; package = BC4A71180870F7945155FBB0; productName = CalendarData; };
+		3D0C442FA94CCCEF93925EE9 /* CalendarData in Frameworks */ = { isa = PBXBuildFile; productRef = A8F4061E780EDDAD48CF4A14; };
+		CAF85B0888D78F1F83771A07 /* Sources */ = { isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (E64CE8B297812FD254158F2A, B469087712AEC4E99332C4BF, 4AD095A5EEC2830029A84AB3, 59571197B1B7472EF84EAB51, 57D3B85B4C7B8DF4FCD57F5E, 342A92EC6F3A659265D85980, 3F0A178DF10E312B9B27ABE8, 38D39E8B8BD94BA594E0C00A, ); runOnlyForDeploymentPostprocessing = 0; };
+		CAFD6B725820BD8EFB592E21 /* Frameworks */ = { isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (B4D14C599949CE577823A45D, 3D0C442FA94CCCEF93925EE9, ); runOnlyForDeploymentPostprocessing = 0; };
+		E89B30AA1DC30A6AD8C34610 /* Resources */ = { isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (7A8DFA9277654386CC0BC2F9, ); runOnlyForDeploymentPostprocessing = 0; };
+		433548979C024CC63B5F3B8D /* Debug */ = { isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; ENABLE_TESTABILITY = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; SWIFT_VERSION = 6.0; }; name = Debug; };
+		B800A40FDE6F0A0218D9BCD2 /* Release */ = { isa = XCBuildConfiguration; buildSettings = { ALWAYS_SEARCH_USER_PATHS = NO; CLANG_ENABLE_MODULES = YES; IPHONEOS_DEPLOYMENT_TARGET = 17.0; SDKROOT = iphoneos; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; SWIFT_VERSION = 6.0; }; name = Release; };
+		3C05BEEE7303EE3FA7B250FA /* Project configurations */ = { isa = XCConfigurationList; buildConfigurations = (433548979C024CC63B5F3B8D, B800A40FDE6F0A0218D9BCD2, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		6CCC433D89988F3E2859E1DB /* Debug */ = { isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 43; ENABLE_TESTABILITY = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Resources/Info.plist; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.example.stillday.calendar; PRODUCT_NAME = Stillday; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)"; SWIFT_OPTIMIZATION_LEVEL = "-Onone"; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Debug; };
+		60E450B27FD0D02DD5AA6B63 /* Release */ = { isa = XCBuildConfiguration; buildSettings = { ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 43; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = Resources/Info.plist; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks"; MARKETING_VERSION = 0.1.0; PRODUCT_BUNDLE_IDENTIFIER = com.example.stillday.calendar; PRODUCT_NAME = Stillday; SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"; SUPPORTS_MACCATALYST = NO; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_OPTIMIZATION_LEVEL = "-O"; TARGETED_DEVICE_FAMILY = "1,2"; }; name = Release; };
+		FC50051CCCB3E62BC1851582 /* App configurations */ = { isa = XCConfigurationList; buildConfigurations = (6CCC433D89988F3E2859E1DB, 60E450B27FD0D02DD5AA6B63, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		34A04005BCAF206EEC990BD9 /* Stillday */ = { isa = PBXNativeTarget; buildConfigurationList = FC50051CCCB3E62BC1851582; buildPhases = (CAF85B0888D78F1F83771A07, CAFD6B725820BD8EFB592E21, E89B30AA1DC30A6AD8C34610, ); buildRules = (); dependencies = (); name = Stillday; packageProductDependencies = (EC3CE7EE7B06D78037034F1E, A8F4061E780EDDAD48CF4A14, ); productName = Stillday; productReference = A8792157CB4F27FB949C035F; productType = "com.apple.product-type.application"; };
+		244210E48437B6556980A702 /* Project object */ = { isa = PBXProject; attributes = { LastSwiftUpdateCheck = 2600; LastUpgradeCheck = 2600; }; buildConfigurationList = 3C05BEEE7303EE3FA7B250FA; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base,); mainGroup = AD936FCBED631FA67E05C3EA; packageReferences = (BC4A71180870F7945155FBB0,); productRefGroup = 0A3E27B8CA818264D75C8D81; projectDirPath = ""; projectRoot = ""; targets = (34A04005BCAF206EEC990BD9,); };
+	};
+	rootObject = 244210E48437B6556980A702;
+}

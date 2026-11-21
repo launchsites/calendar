@@ -1,0 +1,20 @@
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# Keep compiler caches local so the build also works in restricted checkouts.
+mkdir -p .build/clang-cache
+export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-$PWD/.build/clang-cache}"
+swift build --manifest-cache local "$@"
+bin="$(swift build --show-bin-path --manifest-cache local "$@")"
+bundle="$PWD/.build/Stillday.app"
+mkdir -p "$bundle/Contents/"{MacOS,Resources}
+cp -X "$bin/Stillday" "$bundle/Contents/MacOS/Stillday"
+cp -X Resources/Info.plist "$bundle/Contents/Info.plist"
+plutil -insert CFBundleIconFile -string Stillday.icns "$bundle/Contents/Info.plist"
+plutil -insert LSMinimumSystemVersion -string 14.0 "$bundle/Contents/Info.plist"
+cp -X Resources/Stillday.icns "$bundle/Contents/Resources/Stillday.icns"
+# File providers can attach Finder metadata to an app directory inside Documents.
+xattr -d com.apple.FinderInfo "$bundle" 2>/dev/null || true
+codesign --force --sign - "$bundle"
+printf '%s\n' "$bundle"
