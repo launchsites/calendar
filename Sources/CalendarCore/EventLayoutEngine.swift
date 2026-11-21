@@ -131,6 +131,17 @@ public struct DayTimeline: Sendable {
         return max(lastHourEnd, lastCardEnd)
     }
 
+    /// The boundaries of the displayed time ruler, including expanded activity spans.
+    public var rulerAnchors: [(date: Date, offset: Double)] {
+        var result = hours.flatMap { hour in
+            hour.segments.isEmpty
+                ? [(hour.interval.start, hour.top)]
+                : hour.segments.map { ($0.interval.start, $0.top) }
+        }
+        if let last = hours.last { result.append((last.interval.end, last.top + last.height)) }
+        return result
+    }
+
     public func offset(for date: Date) -> Double? {
         guard let hour = hours.first(where: { $0.interval.start <= date && date < $0.interval.end }) else { return nil }
         if let segment = hour.segments.first(where: { $0.interval.start <= date && date < $0.interval.end }) {

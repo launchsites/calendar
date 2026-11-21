@@ -83,12 +83,85 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([event.start.day for event in events], [21, 22])
         self.assertTrue(all(not event.editable for event in events))
 
+    def test_resize_preserves_unmoved_time_metadata_and_checks_version(self):
+        event, = occurrences(CAL, HREF, '"first"', DATA, START, END, ZONE)
+        store = ICloudStore("demo@example.invalid", "fixture")
+        with patch.object(store, "request") as request:
+            new_end = END.replace(minute=15)
+            store.resize(event, START, new_end)
+            method, href, body, headers = request.call_args.args
+            self.assertEqual((method, href, headers["If-Match"]), ("PUT", HREF, '"first"'))
+            edited, = icalendar.Calendar.from_ical(body).walk("VEVENT")
+            self.assertEqual(edited.decoded("DTSTART"), START)
+            self.assertEqual(edited.decoded("DTEND"), new_end)
+            self.assertEqual(str(edited["LOCATION"]), "Workshop")
+            self.assertEqual(str(edited["X-EXTRA"]), "Keep this")
+
     def test_stale_write_has_a_user_facing_error(self):
         response = requests.Response()
         response.status_code = 412
         with patch("caldav_store.requests.request", return_value=response):
             with self.assertRaisesRegex(CalendarError, "changed on another device"):
                 ICloudStore("demo@example.invalid", "fixture").request("PUT", HREF)
+
+
+class InstallTests(unittest.TestCase):
+    def test_desktop_identity_uses_the_calendar_icon_and_installed_revision(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from calendar_install import APP_ID, ROOT, icon_png, install, installed_revision
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder) / 'Sample % calendar'
+            (root / "Resources").mkdir(parents=True)
+            (root / "Linux").mkdir()
+            (root / "Resources/Stillday.icns").write_bytes((ROOT / "Resources/Stillday.icns").read_bytes())
+            (root / "Linux/source-revision").write_text("a" * 40)
+            home = Path(folder) / "data"
+            install(root, home)
+            launcher = (home / f"applications/{APP_ID}.desktop").read_text()
+            self.assertIn("Name=Calendar\n", launcher)
+            self.assertIn(f"StartupWMClass={APP_ID}\n", launcher)
+            self.assertIn("Sample %% calendar/Scripts/run-linux", launcher)
+            png = home / f"icons/hicolor/1024x1024/apps/{APP_ID}.png"
+            self.assertEqual(png.read_bytes(), icon_png())
+            self.assertEqual(installed_revision(root), "a" * 40)
+
+    def test_clean_checkout_fast_forwards_and_dirty_checkout_is_preserved(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from calendar_update import git, install_update
+
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "source"
+            source.mkdir()
+            git(source, "init", "-b", "main")
+            git(source, "config", "user.name", "Fixture")
+            git(source, "config", "user.email", "demo@example.invalid")
+            (source / "Scripts").mkdir()
+            (source / ".gitignore").write_text(".build/\n")
+            (source / "Scripts/setup-linux").write_text(
+                "#!/bin/sh\nmkdir -p .build\ngit rev-parse HEAD > .build/linux-installed-revision\n"
+            )
+            git(source, "add", ".gitignore", "Scripts")
+            git(source, "commit", "-m", "Initial")
+            git(root, "clone", str(source), "checkout")
+            checkout = root / "checkout"
+            first = git(checkout, "rev-parse", "HEAD")
+            (source / "version").write_text("new")
+            git(source, "add", "version")
+            git(source, "commit", "-m", "Update")
+            revision = git(source, "rev-parse", "HEAD")
+            with patch("calendar_update.REPO", str(source)):
+                dirty = checkout / "local-changes"
+                dirty.write_text("keep")
+                with self.assertRaisesRegex(CalendarError, "local changes"):
+                    install_update(revision, checkout)
+                self.assertEqual(git(checkout, "rev-parse", "HEAD"), first)
+                dirty.unlink()
+                self.assertEqual(install_update(revision, checkout), checkout / "Scripts/run-linux")
+            self.assertEqual(git(checkout, "rev-parse", "HEAD"), revision)
 
 
 @unittest.skipUnless(os.environ.get("CALENDAR_CORE_TEST_BIN"), "requires the built Swift helper")
@@ -212,6 +285,41 @@ class DesktopTests(unittest.TestCase):
         settle()
         self.assertEqual(len(window.writable_calendars()), 4)
 
+        chosen = window.calendars[0]
+        from calendar_app import Draft
+        from datetime import timedelta
+        for day in (2, 6, 10):
+            start = fixed_now - timedelta(days=day)
+            window.store.save(chosen, Draft("Fixture review", start, start + timedelta(minutes=30), ""))
+        window.history.open("seed-fixture")
+        settle()
+        self.assertTrue(window.history.seeded)
+        self.assertEqual(window.history.suggest("Fixture review", window.writable_calendars(), None),
+                         {"id": chosen.url, "suggested": True})
+        for _ in range(3):
+            window.history.record("Sample appointment", chosen, fixed_now)
+        forecast = Editor(window, calendars=window.writable_calendars())
+        forecast.title.setText(" sample APPOINTMENT ")
+        QtTest.QTest.qWait(210)
+        self.assertEqual(forecast.calendar.currentData(), chosen)
+        self.assertFalse(forecast.suggestion_row.isHidden())
+        forecast.dismiss_suggestion.click()
+        self.assertFalse(forecast.calendar.currentData())
+        forecast.quick.setText("Sample appointment /Personal")
+        forecast.parse()
+        self.assertEqual(forecast.calendar.currentData().title, "Personal")
+        forecast.close()
+
+        window.installed_revision = "a" * 40
+        panel = SettingsDialog(window)
+        with patch("calendar_app.latest_revision", return_value="b" * 40):
+            panel.check.click()
+            settle()
+        self.assertEqual(window.remote_revision, "b" * 40)
+        self.assertFalse(window.update_notice.isHidden())
+        self.assertTrue(panel.install.isEnabled())
+        panel.close()
+
         captures = []
 
         def receive(event=None, selection=None):
@@ -238,6 +346,27 @@ class DesktopTests(unittest.TestCase):
                 QtTest.QTest.qWait(50)
                 self.assertEqual(captures[-1], (int(first["time"]), int(last["time"])))
             self.assertEqual(len(captures), 2)
+
+        window.change_view("Day")
+        settle()
+        timeline = window.timeline
+        _, _, entry = next(card for card in timeline.cards if card[2].item.key == saved.key)
+        timeline.area.verticalScrollBar().setValue(entry.y() - 90)
+        point = QtCore.QPoint(entry.width() // 2, round(entry.geometry_data["coreBottom"]) - 2)
+        original_end = saved.end.timestamp()
+        target_y = timeline.displayed_top(0, original_end + 1800)
+        dy = round(target_y - timeline.displayed_top(0, original_end))
+        QtTest.QTest.qWait(30)
+        QtTest.QTest.mousePress(entry, QtCore.Qt.MouseButton.LeftButton, pos=point)
+        QtTest.QTest.mouseMove(entry, point + QtCore.QPoint(0, dy), delay=50)
+        QtTest.QTest.mouseRelease(entry, QtCore.Qt.MouseButton.LeftButton, pos=point + QtCore.QPoint(0, dy))
+        QtTest.QTest.qWait(70)
+        settle()
+        settle()
+        resized = next(event for event in window.events if event.title == saved.title)
+        self.assertEqual(resized.end.timestamp(), original_end + 1800)
+        self.assertEqual(resized.start, saved.start)
+        self.assertEqual(resized.notes, saved.notes)
 
         window.render()
         app.processEvents()

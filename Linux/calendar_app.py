@@ -18,6 +18,10 @@ from tzlocal import get_localzone
 from caldav_store import Calendar, CalendarError, Draft, Event, ICloudStore, local_time
 from desktop_style import CheckBox, DesktopStyle, EventButton, button, icon, label
 from calendar_settings import Buffer, Preferences, SettingsDialog, edit_buffer
+from calendar_install import APP_ID, icon_png, installed_revision
+from calendar_history import CalendarHistory
+from activity_icons import activity_icon
+from calendar_update import install_update, latest_revision
 from calendar_timeline import GUTTER, SCROLLBAR, Timeline
 
 
@@ -78,6 +82,10 @@ class Editor(Qt.QDialog):
         self.owner, self.original = window, event
         self.selection = selection
         self.preferences = window.preferences
+        self.choices = calendars
+        self.manual_calendar = False
+        self.explicit_calendar = None
+        self.dismissed_title = None
         caption = "Event details" if event else "New event"
         self.setWindowTitle(caption)
         self.resize(520, 395)
@@ -143,6 +151,24 @@ class Editor(Qt.QDialog):
         if not event:
             form.addRow("", self.weekly)
         form.addRow("Calendar", self.calendar)
+        if not event:
+            suggestion = Qt.QHBoxLayout()
+            self.suggestion_label = label("Suggested from previous events", tone="muted", size=12)
+            self.dismiss_suggestion = button("×", name="Dismiss calendar suggestion", size=(28, 28))
+            self.dismiss_suggestion.clicked.connect(self.dismiss_calendar)
+            self.suggestion_row = Qt.QWidget()
+            self.suggestion_row.setLayout(suggestion)
+            suggestion.setContentsMargins(0, 0, 0, 0)
+            suggestion.addWidget(self.suggestion_label)
+            suggestion.addWidget(self.dismiss_suggestion)
+            suggestion.addStretch()
+            self.suggestion_row.hide()
+            form.addRow("", self.suggestion_row)
+            self.suggestion_timer = QtCore.QTimer(self, interval=180, singleShot=True)
+            self.suggestion_timer.timeout.connect(self.predict_calendar)
+            self.title.textChanged.connect(lambda: self.suggestion_timer.start())
+            window.history_changed.connect(self.predict_calendar)
+            self.calendar.activated.connect(self.calendar_selected)
         form.addRow("Time around event", timing)
         form.addRow("Description", self.notes)
         form.addRow(self.status)
@@ -180,6 +206,7 @@ class Editor(Qt.QDialog):
             text = f"{side.capitalize()} · {value.summary()}" if value else f"+ Add time {side}"
             control.setText(control.fontMetrics().elidedText(text, QtCore.Qt.TextElideMode.ElideRight, 168))
             control.setAccessibleName(text)
+            control.setIcon(activity_icon(value, self.owner.look.text) if value else QtGui.QIcon())
             control.setToolTip(text)
             control.setEnabled(not self.all_day.isChecked())
 
@@ -221,17 +248,44 @@ class Editor(Qt.QDialog):
             self.update_buffers()
             self.entry_zone = result["timeZone"]
             notice = result["notice"]
-            requested = result["requestedCalendar"]
-            if requested:
-                matches = [i for i in range(self.calendar.count()) if self.calendar.itemData(i)
-                           and self.calendar.itemText(i).casefold() == requested.casefold()]
-                self.calendar.setCurrentIndex(matches[0] if len(matches) == 1 else -1)
-                if len(matches) != 1:
-                    self.status.setText(f"Choose the calendar to use for /{requested}.")
-                    return
+            self.explicit_calendar = result["requestedCalendar"] or None
+            if self.explicit_calendar:
+                self.manual_calendar = False
             self.status.setText(notice or "Review the event, then save.")
+            self.predict_calendar()
         except CalendarError as error:
             self.status.setText(str(error))
+
+    def calendar_selected(self):
+        self.manual_calendar = True
+        self.explicit_calendar = None
+        self.suggestion_row.hide()
+
+    def dismiss_calendar(self):
+        self.dismissed_title = self.title.text().strip().casefold()
+        self.predict_calendar()
+
+    def predict_calendar(self):
+        if self.original or self.manual_calendar:
+            return
+        title = self.title.text().strip()
+        if self.dismissed_title is not None and self.dismissed_title != title.casefold():
+            self.dismissed_title = None
+        try:
+            result = self.owner.history.suggest(title, self.choices, self.explicit_calendar,
+                                                use_history=self.dismissed_title is None)
+        except CalendarError:
+            self.suggestion_row.hide()
+            return
+        calendar_id = result.get("id")
+        index = next((i for i in range(self.calendar.count())
+                      if (item := self.calendar.itemData(i)) and item.url == calendar_id), -1)
+        if not calendar_id and not self.explicit_calendar and self.calendar.count() and self.calendar.itemData(0) is None:
+            index = 0
+        self.calendar.setCurrentIndex(index)
+        self.suggestion_row.setVisible(result.get("suggested", False))
+        if self.explicit_calendar and "message" in result:
+            self.status.setText(result["message"])
 
     def save(self):
         calendar = self.calendar.currentData()
@@ -256,7 +310,11 @@ class Editor(Qt.QDialog):
             self.status.setText("Enter a title and an end after the start.")
             return
         store = self.owner.store
-        self.write(lambda: store.save(calendar, draft, self.original))
+        def learn():
+            if not self.original:
+                self.owner.history.record(draft.title, calendar, draft.start)
+
+        self.write(lambda: store.save(calendar, draft, self.original), learn)
 
     def delete(self):
         answer = Qt.QMessageBox.question(self, "Delete event", f"Delete “{self.original.title}” from iCloud?",
@@ -266,7 +324,7 @@ class Editor(Qt.QDialog):
             store = self.owner.store
             self.write(lambda: store.delete(self.original))
 
-    def write(self, action):
+    def write(self, action, saved=None):
         self.buttons.setEnabled(False)
         self.status.setText("Applying changes…")
         self.writing = True
@@ -277,6 +335,8 @@ class Editor(Qt.QDialog):
             if error:
                 self.status.setText(error)
             else:
+                if saved:
+                    saved()
                 self.accept()
                 self.owner.refresh()
 
@@ -288,12 +348,21 @@ class Editor(Qt.QDialog):
 
 
 class CalendarWindow(Qt.QMainWindow):
-    def __init__(self, core, clock=None):
+    history_changed = QtCore.Signal()
+    update_changed = QtCore.Signal()
+
+    def __init__(self, core, clock=None, settings=None):
         super().__init__()
         self.core = core
         self.now = clock or (lambda: datetime.now(ZONE))
-        self.settings = QtCore.QSettings()
+        self.settings = settings if settings is not None else QtCore.QSettings()
         self.preferences = Preferences.load(self.settings)
+        self.history = CalendarHistory(self)
+        self.installed_revision = installed_revision()
+        self.remote_revision = None
+        self.update_message = "Check GitHub for a newer version."
+        self.update_busy = False
+        self.update_launcher = None
         self.pool = QtCore.QThreadPool(self)
         self.pool.setMaxThreadCount(2)
         self.workers = set()
@@ -304,6 +373,7 @@ class CalendarWindow(Qt.QMainWindow):
         self.refresh_pending = False
         self.render_pending = False
         self.timeline = None
+        self.resizing = set()
         self.snapshot = None
         self.connecting = False
         self.is_demo = False
@@ -319,6 +389,8 @@ class CalendarWindow(Qt.QMainWindow):
         self.setCentralWidget(container)
         self.icon_buttons = []
         root.addWidget(self.build_toolbar())
+        self.update_notice = self.build_update_notice()
+        root.addWidget(self.update_notice)
         body = Qt.QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
@@ -349,6 +421,9 @@ class CalendarWindow(Qt.QMainWindow):
         self.timer = QtCore.QTimer(self, interval=180000)
         self.timer.timeout.connect(self.refresh)
         self.timer.start()
+        self.update_timer = QtCore.QTimer(self, interval=3 * 60 * 60 * 1000)
+        self.update_timer.timeout.connect(self.check_updates)
+        self.update_timer.start()
         self.apply_appearance()
 
     def icon_button(self, glyph, name, action, *, size=(34, 34)):
@@ -557,8 +632,80 @@ class CalendarWindow(Qt.QMainWindow):
         menu.addAction("Manage profiles…", self.open_settings)
         menu.exec(self.profile_button.mapToGlobal(QtCore.QPoint(0, self.profile_button.height())))
 
-    def open_settings(self):
-        SettingsDialog(self).exec()
+    def open_settings(self, updates=False):
+        dialog = SettingsDialog(self)
+        if updates:
+            dialog.tabs.setCurrentWidget(dialog.updates_tab)
+        dialog.exec()
+        dialog.deleteLater()
+
+    def build_update_notice(self):
+        notice = Qt.QWidget(objectName="allDayRow")
+        row = Qt.QHBoxLayout(notice)
+        row.setContentsMargins(16, 5, 16, 5)
+        self.update_notice_text = label("A Calendar update is available.", tone="accent")
+        row.addWidget(self.update_notice_text, 1)
+        settings = button("View update", "secondary")
+        settings.clicked.connect(lambda: self.open_settings(updates=True))
+        row.addWidget(settings)
+        dismiss = button("×", name="Dismiss update notice", size=(28, 28))
+        dismiss.clicked.connect(notice.hide)
+        row.addWidget(dismiss)
+        notice.hide()
+        return notice
+
+    def check_updates(self):
+        if self.update_busy or self.update_launcher:
+            return
+        self.update_busy = True
+        self.update_message = "Checking GitHub…"
+        self.update_changed.emit()
+
+        def complete(revision, error):
+            self.update_busy = False
+            if error:
+                self.update_message = error
+            else:
+                newer = revision != self.installed_revision
+                announce = newer and self.remote_revision != revision
+                self.remote_revision = revision
+                self.update_message = "An update is available." if newer else "You’re up to date."
+                if announce:
+                    self.update_notice.show()
+                elif not newer:
+                    self.update_notice.hide()
+            self.update_changed.emit()
+
+        self.work(latest_revision, complete)
+
+    def apply_update(self):
+        if self.update_launcher:
+            args = ["--demo"] if self.is_demo else []
+            started, _ = QtCore.QProcess.startDetached(str(self.update_launcher), args)
+            if started:
+                Qt.QApplication.quit()
+            else:
+                self.update_message = "The update is ready. Start Calendar from your app menu."
+                self.update_changed.emit()
+            return
+        if self.update_busy or not self.remote_revision or self.remote_revision == self.installed_revision:
+            return
+        self.update_busy = True
+        self.update_message = "Downloading and building Calendar…"
+        self.update_changed.emit()
+        revision = self.remote_revision
+
+        def done(launcher, error):
+            self.update_busy = False
+            self.update_launcher = launcher
+            self.update_message = error or "Update installed. Restart Calendar to use it."
+            if not error:
+                self.installed_revision = revision
+                self.update_notice_text.setText("Restart Calendar to finish updating.")
+                self.update_notice.show()
+            self.update_changed.emit()
+
+        self.work(lambda: install_update(revision), done)
 
     def select_profile(self, profile_id):
         self.preferences.current = profile_id
@@ -752,6 +899,7 @@ class CalendarWindow(Qt.QMainWindow):
                 except Exception:
                     self.session_notice = "One-session sign-in. The system keyring is unavailable."
             self.refresh()
+            self.history.open(username)
 
         self.work(store.discover, done)
 
@@ -869,7 +1017,7 @@ class CalendarWindow(Qt.QMainWindow):
             widget.deleteLater()
 
     def render(self):
-        if self.timeline is not None and self.timeline.drag_anchor is not None:
+        if self.timeline is not None and self.timeline.interacting:
             self.render_pending = True
             return
         days = self.window_days()
@@ -1100,6 +1248,24 @@ class CalendarWindow(Qt.QMainWindow):
         hidden = self.hidden()
         return tuple(item for item in self.ordered_calendars() if item.writable and item.url not in hidden)
 
+    def resize_event(self, event, start, end):
+        if not event.editable or event.key in self.resizing:
+            return
+        self.resizing.add(event.key)
+        store = self.store
+        self.set_status("Updating event time…", "working")
+
+        def done(result, error):
+            self.resizing.discard(event.key)
+            if store is not self.store:
+                return
+            if error:
+                self.set_status(error, "error")
+            else:
+                self.refresh()
+
+        self.work(lambda: store.resize(event, start, end), done)
+
     def open_editor(self, event=None, selection=None):
         if not self.store:
             self.connect_dialog()
@@ -1171,6 +1337,9 @@ def demo(window):
             return [event for event in self.records if event.calendar == calendar and
                     event.start < end and event.end > start]
 
+        def resize(self, event, start, end):
+            self.save(event.calendar, Draft(event.title, start, end, event.notes), event)
+
         def delete(self, event):
             self.records.remove(event)
 
@@ -1178,6 +1347,7 @@ def demo(window):
     window.is_demo = True
     window.account.hide()
     window.refresh()
+    window.history.open("calendar-demo")
 
 
 def main():
@@ -1185,17 +1355,27 @@ def main():
     args.add_argument("--core", required=True, type=Path)
     args.add_argument("--demo", action="store_true")
     options = args.parse_args()
-    app = Qt.QApplication([sys.argv[0]])
+    app = Qt.QApplication([APP_ID, "-name", APP_ID])
+    app.setDesktopFileName(APP_ID)
+    app.setApplicationDisplayName("Calendar")
+    pixmap = QtGui.QPixmap()
+    try:
+        if pixmap.loadFromData(icon_png()):
+            app.setWindowIcon(QtGui.QIcon(pixmap))
+    except (OSError, ValueError):
+        pass
     breeze = next((style for style in Qt.QStyleFactory.keys() if style.lower() == "breeze"), None)
     app.setStyle(breeze or "Fusion")
     app.setOrganizationName("Stillday")
-    app.setApplicationName("Calendar Demo" if options.demo else "Calendar")
-    window = CalendarWindow(Core(str(options.core.resolve())))
+    app.setApplicationName(APP_ID)
+    settings = QtCore.QSettings("Stillday", "Calendar Demo" if options.demo else "Calendar")
+    window = CalendarWindow(Core(str(options.core.resolve())), settings=settings)
     window.show()
     if options.demo:
         demo(window)
     else:
         QtCore.QTimer.singleShot(0, window.start)
+    QtCore.QTimer.singleShot(1500, window, window.check_updates)
     return app.exec()
 
 

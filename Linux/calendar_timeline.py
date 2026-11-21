@@ -1,10 +1,13 @@
 """Interactive timed Day and Week canvas."""
 
 from bisect import bisect_left
+from dataclasses import dataclass
+from math import ceil, floor
 from datetime import datetime
 
 from PySide6 import QtCore, QtGui, QtWidgets as Qt
 
+from activity_icons import draw_symbol, symbol
 from calendar_settings import Buffer
 from desktop_style import EventButton, mix
 
@@ -19,12 +22,39 @@ def rect(x, y, width, height):
     return QtCore.QRectF(x, y, max(0, width), max(0, height))
 
 
+@dataclass
+class ResizeDrag:
+    column: int
+    card: object
+    edge: str
+    origin: float
+    press: QtCore.QPoint
+    start: float
+    end: float
+
+
+def interpolate(value, coordinates, values):
+    index = bisect_left(coordinates, value)
+    if index == 0:
+        return values[0]
+    if index == len(coordinates):
+        return values[-1]
+    a, b = coordinates[index - 1:index + 1]
+    fraction = (value - a) / (b - a) if b > a else 0
+    return values[index - 1] + fraction * (values[index] - values[index - 1])
+
+
+
 class ActivityCard(EventButton):
-    def __init__(self, event, geometry, owner, colors, parent):
+    def __init__(self, event, geometry, owner, colors, parent, column):
         time = owner.preferences.time_label
         caption = f"{time(event.start)} – {time(event.end)}"
         super().__init__(event, owner.look, caption=caption, parent=parent)
+        self.item = event
+        self.timeline = parent
+        self.column = column
         self.geometry_data = geometry
+        self.setMouseTracking(True)
         self.preferences = owner.preferences
         self.before = Buffer(**geometry["before"]) if geometry["before"] else None
         self.after = Buffer(**geometry["after"]) if geometry["after"] else None
@@ -35,6 +65,44 @@ class ActivityCard(EventButton):
         if details:
             self.setToolTip(self.toolTip() + "\n" + "\n".join(details))
             self.setAccessibleName(self.toolTip())
+
+    def resize_edge(self, y):
+        if not self.item.editable or self.item.key in self.timeline.owner.resizing:
+            return None
+        track_start, track_end = self.timeline.rulers[self.column][0][0], self.timeline.rulers[self.column][0][-1]
+        top = self.geometry_data["coreTop"]
+        bottom = min(self.height(), self.geometry_data["coreBottom"] - 2)
+        candidates = [(abs(y - edge_y), edge) for edge_y, stamp, edge in (
+            (max(0, top), self.item.start.timestamp(), "start"),
+            (max(0, bottom), self.item.end.timestamp(), "end"),
+        ) if track_start <= stamp <= track_end]
+        nearest = min(candidates, default=(float("inf"), None))
+        return nearest[1] if nearest[0] <= 5 else None
+
+    def mousePressEvent(self, event):
+        edge = self.resize_edge(event.position().y())
+        if edge and event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.timeline.begin_resize(self, edge, event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        global_pos = event.globalPosition().toPoint()
+        if self.timeline.resize_drag and self.timeline.resize_drag.card is self:
+            self.timeline.update_resize(global_pos)
+            event.accept()
+            return
+        self.setCursor(QtCore.Qt.CursorShape.SizeVerCursor if self.resize_edge(event.position().y())
+                       else QtCore.Qt.CursorShape.PointingHandCursor)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self.timeline.resize_drag and self.timeline.resize_drag.card is self:
+            self.timeline.end_resize(event.globalPosition().toPoint())
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def paintEvent(self, event):
         look = self.styling
@@ -64,7 +132,8 @@ class ActivityCard(EventButton):
             self.stripe(p, accent, start, end, dotted=True)
             if end - start >= 17:
                 p.setPen(QtGui.QColor(look.text))
-                self.text_line(p, start, end - start, "◷  " + data.summary(), 11)
+                draw_symbol(p, symbol(data), 11, start + (end - start - 13) / 2, 13, look.text)
+                self.text_line(p, start, end - start, data.summary(), 11, left=28)
 
         cursor = top
         for start, end, color in sorted(self.markers):
@@ -80,15 +149,18 @@ class ActivityCard(EventButton):
         if h >= 14:
             p.setPen(QtGui.QColor(look.text))
             self.text_line(p, top + 1, min(h - 2, 21), self.text(), 13, strong=True)
-        collapsed = [f"{buf.minutes}m {name}" for name, buf, height in
+        collapsed = [(name, buf) for name, buf, height in
                      (("before", self.before, top), ("after", self.after, box.bottom() - bottom))
                      if buf and 0 < height < 17]
         if h >= 37:
             p.setPen(QtGui.QColor(look.muted))
-            caption = " · ".join(collapsed) if collapsed and h < 52 else self.caption
-            self.text_line(p, top + 21, 15, caption, 11)
-        if collapsed and h >= 52:
-            self.text_line(p, top + 35, 15, " · ".join(collapsed), 10)
+            if not collapsed or h >= 52:
+                self.text_line(p, top + 21, 15, self.caption, 11)
+            if collapsed:
+                y = top + (35 if h >= 52 else 21)
+                draw_symbol(p, symbol(collapsed[0][1]), 11, y + 1, 12, look.muted)
+                caption = " · ".join(f"{buf.minutes}m {name}" for name, buf in collapsed)
+                self.text_line(p, y, 15, caption, 10, left=27)
 
         p.restore()
         p.setPen(QtGui.QPen(QtGui.QColor(look.accent if self.hasFocus() else mix(accent, look.surface, 0.27)), 1))
@@ -113,14 +185,14 @@ class ActivityCard(EventButton):
             y += 6
         painter.restore()
 
-    def text_line(self, painter, y, height, string, size, strong=False):
+    def text_line(self, painter, y, height, string, size, strong=False, left=12):
         font = self.font()
         font.setPixelSize(size)
         font.setWeight(QtGui.QFont.Weight.DemiBold if strong else QtGui.QFont.Weight.Normal)
         painter.setFont(font)
-        width = max(0, self.width() - 19)
+        width = max(0, self.width() - left - 7)
         shown = painter.fontMetrics().elidedText(string, QtCore.Qt.TextElideMode.ElideRight, width)
-        painter.drawText(rect(12, y, width, height), ALIGN, shown)
+        painter.drawText(rect(left, y, width, height), ALIGN, shown)
 
 
 class Timeline(Qt.QWidget):
@@ -131,6 +203,7 @@ class Timeline(Qt.QWidget):
         self.today = owner.now().date()
         self.zone = owner.now().tzinfo
         self.drag_anchor = None
+        self.resize_drag = None
         self.drag_tip = None
         self.drag_moved = False
         self.drag_pointer = None
@@ -139,6 +212,8 @@ class Timeline(Qt.QWidget):
         self.drag_scroll = QtCore.QTimer(self, interval=25)
         self.drag_scroll.timeout.connect(self.scroll_drag)
         self.snap_tops = [[point["top"] for point in day["snap"]] for day in layout]
+        self.rulers = [([point["time"] for point in day["ruler"]], [point["top"] for point in day["ruler"]])
+                       for day in layout]
         by_key = {event.key: event for event in events}
         colors = {event.key: event.calendar.color for event in events}
         self.setMinimumHeight(int(max(x["height"] for x in layout)) + TRACK_PAD * 2)
@@ -147,7 +222,7 @@ class Timeline(Qt.QWidget):
         for column, data in enumerate(layout):
             for card in sorted(data["cards"], key=lambda item: not item["behind"]):
                 event = by_key[card["id"]]
-                entry = ActivityCard(event, card, owner, colors, self)
+                entry = ActivityCard(event, card, owner, colors, self, column)
                 entry.clicked.connect(lambda checked=False, item=event: self.owner.open_editor(item))
                 self.cards.append((column, card, entry))
         self.overlay = TimelineOverlay(self)
@@ -164,6 +239,65 @@ class Timeline(Qt.QWidget):
                               max(1, round(card["height"]) - 2))
         self.overlay.setGeometry(self.rect())
         super().resizeEvent(event)
+
+    @property
+    def interacting(self):
+        return self.drag_anchor is not None or self.resize_drag is not None
+
+    def displayed_time(self, column, y):
+        times, stops = self.rulers[column]
+        return interpolate(y - TRACK_PAD, stops, times)
+
+    def displayed_top(self, column, stamp):
+        times, stops = self.rulers[column]
+        return interpolate(stamp, times, stops) + TRACK_PAD
+
+    def begin_resize(self, card, edge, point):
+        initial = self.displayed_time(card.column, self.mapFromGlobal(point).y())
+        self.resize_drag = ResizeDrag(card.column, card, edge, initial, point,
+                                      card.item.start.timestamp(), card.item.end.timestamp())
+        card.setCursor(QtCore.Qt.CursorShape.SizeVerCursor)
+        self.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
+        self.drag_pointer = point
+        self.drag_scroll.start()
+
+    def update_resize(self, point):
+        drag = self.resize_drag
+        self.drag_pointer = point
+        if abs(point.y() - drag.press.y()) >= 3:
+            self.drag_moved = True
+        if not self.drag_moved:
+            return
+        delta = self.displayed_time(drag.column, self.mapFromGlobal(point).y()) - drag.origin
+        unit = self.owner.preferences.snap * 60
+        steps = floor(delta / unit + 0.5) if delta >= 0 else ceil(delta / unit - 0.5)
+        times, _ = self.rulers[drag.column]
+        start, end = drag.card.item.start.timestamp(), drag.card.item.end.timestamp()
+        if drag.edge == "start":
+            minimum = ceil((times[0] - start) / unit)
+            maximum = floor((min(times[-1], end - 60) - start) / unit)
+            if minimum <= maximum:
+                start += min(max(steps, minimum), maximum) * unit
+        else:
+            minimum = ceil((max(times[0], start + 60) - end) / unit)
+            maximum = floor((times[-1] - end) / unit)
+            if minimum <= maximum:
+                end += min(max(steps, minimum), maximum) * unit
+        if end <= start:
+            start, end = drag.card.item.start.timestamp(), drag.card.item.end.timestamp()
+        drag.start, drag.end = start, end
+        self.overlay.update()
+
+    def end_resize(self, point):
+        drag = self.resize_drag
+        self.update_resize(point)
+        moved = self.drag_moved
+        self.finish_drag()
+        if (drag.start, drag.end) != (drag.card.item.start.timestamp(), drag.card.item.end.timestamp()):
+            self.owner.resize_event(drag.card.item, datetime.fromtimestamp(drag.start, self.zone),
+                                    datetime.fromtimestamp(drag.end, self.zone))
+        elif not moved:
+            drag.card.clicked.emit(False)
 
     def nearest_slot(self, column, y):
         tops = self.snap_tops[column]
@@ -211,7 +345,7 @@ class Timeline(Qt.QWidget):
             self.overlay.update()
 
     def scroll_drag(self):
-        if self.drag_anchor is None or not self.drag_moved:
+        if not self.interacting or not self.drag_moved:
             return
         viewport = self.area.viewport()
         pos = viewport.mapFromGlobal(self.drag_pointer)
@@ -222,7 +356,10 @@ class Timeline(Qt.QWidget):
             bar.setValue(bar.value() - 10)
         elif pos.y() > viewport.height() - 24:
             bar.setValue(bar.value() + 10)
-        self.update_drag(self.mapFromGlobal(self.drag_pointer).y())
+        if self.resize_drag:
+            self.update_resize(self.drag_pointer)
+        else:
+            self.update_drag(self.mapFromGlobal(self.drag_pointer).y())
 
     def selection(self):
         if self.drag_anchor is None:
@@ -236,7 +373,7 @@ class Timeline(Qt.QWidget):
 
     def finish_drag(self):
         self.drag_scroll.stop()
-        self.drag_anchor = self.drag_tip = self.drag_pointer = None
+        self.drag_anchor = self.drag_tip = self.drag_pointer = self.resize_drag = None
         self.drag_moved = False
         self.overlay.update()
         if self.owner.render_pending:
@@ -258,7 +395,7 @@ class Timeline(Qt.QWidget):
         event.accept()
 
     def keyPressEvent(self, event):
-        if self.drag_anchor is not None and event.key() == QtCore.Qt.Key.Key_Escape:
+        if self.interacting and event.key() == QtCore.Qt.Key.Key_Escape:
             self.finish_drag()
             event.accept()
         else:
@@ -323,6 +460,21 @@ class TimelineOverlay(Qt.QWidget):
             full = f"{a} – {b}"
             text = full if p.fontMetrics().horizontalAdvance(full) <= width - 12 else a
             p.drawText(rect(x + 6, top + 1, width - 12, min(height, 21)), ALIGN, text)
+        drag = timeline.resize_drag
+        if drag and timeline.drag_moved:
+            card = drag.card
+            top = timeline.displayed_top(drag.column, drag.start)
+            bottom = timeline.displayed_top(drag.column, drag.end)
+            width = card.width()
+            x = card.x()
+            p.setPen(QtGui.QPen(accent, 1.5))
+            p.setBrush(QtGui.QColor(mix(card.color, look.surface, 0.37)))
+            p.drawRoundedRect(rect(x, top, width, max(2, bottom - top)), 6, 6)
+            times = [time(datetime.fromtimestamp(stamp, timeline.zone)) for stamp in (drag.start, drag.end)]
+            y = (top if drag.edge == "start" else bottom) - 11
+            p.fillRect(rect(x + 5, y, min(112, width - 10), 22), accent)
+            p.setPen(QtGui.QColor(look.on_accent))
+            p.drawText(rect(x + 10, y, min(102, width - 20), 22), ALIGN, " – ".join(times))
         for column, day in enumerate(timeline.track):
             if day["now"] is None:
                 continue

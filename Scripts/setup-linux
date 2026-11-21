@@ -16,4 +16,5 @@ fi
 swift build -c release --product calendar-linux-core
 python3 -m venv .build/linux-venv
 .build/linux-venv/bin/python -m pip install -r Linux/requirements.txt
+.build/linux-venv/bin/python Linux/calendar_install.py
 printf '\nStart Calendar with Scripts/run-linux (or add --demo for sample events).\n'

@@ -25,6 +25,16 @@ private struct Buffers: Decodable {
     let after: ActivityBuffer?
 }
 
+private struct UsageEntry: Decodable {
+    let title: String
+    let calendarID: String
+}
+
+private struct CalendarOption: Decodable {
+    let id: String
+    let title: String
+}
+
 private struct Request: Decodable {
     let operation: String
     let text: String?
@@ -44,6 +54,11 @@ private struct Request: Decodable {
     let beforeDefault: ActivityBufferDefaults?
     let afterDefault: ActivityBufferDefaults?
     let buffers: Buffers?
+    let usage: CalendarUsage?
+    let choices: [UsageEntry]?
+    let calendars: [CalendarOption]?
+    let preferredCalendar: String?
+    let requestedCalendar: String?
 }
 
 private enum BridgeError: LocalizedError {
@@ -141,6 +156,7 @@ private func track(_ request: Request, events: [CalendarEvent], in range: DateIn
         "now": timeline.offset(for: request.now ?? Date()) as Any? ?? NSNull(),
         "hours": timeline.hours.map { ["start": $0.interval.start.timeIntervalSince1970, "top": $0.top] },
         "snap": grid.map { ["time": $0.timeIntervalSince1970, "top": offset($0)] },
+        "ruler": timeline.rulerAnchors.map { ["time": $0.date.timeIntervalSince1970, "top": $0.offset] },
         "cards": cards,
     ]
 }
@@ -170,6 +186,26 @@ private func run(_ request: Request) throws -> Any {
         details.before = request.buffers?.before
         details.after = request.buffers?.after
         return details.notes(description: request.description) ?? ""
+    case "learnCalendars":
+        var usage = request.usage ?? CalendarUsage()
+        for choice in request.choices ?? [] {
+            usage.record(title: choice.title, calendarID: choice.calendarID)
+        }
+        return try JSONSerialization.jsonObject(with: JSONEncoder().encode(usage))
+    case "suggestCalendar":
+        let result = CalendarPrediction.resolve(
+            requested: request.requestedCalendar, title: request.text ?? "",
+            calendars: (request.calendars ?? []).map {
+                CalendarChoice(id: $0.id, title: $0.title, source: "iCloud", isWritable: true)
+            }, aliases: [:], rules: [:], preferredID: request.preferredCalendar, systemID: nil,
+            locale: .current, history: request.usage
+        )
+        switch result {
+        case .selected(let id, let reason):
+            return ["id": id, "suggested": reason == .history]
+        case .choose(let message):
+            return ["message": message]
+        }
     case "layout":
         let events = (request.items ?? []).map(\.event)
         return (request.days ?? []).compactMap { day in

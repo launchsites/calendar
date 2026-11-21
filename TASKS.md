@@ -92,4 +92,5 @@ Physical-device startup was verified. Simulator runs, calendar writes, VoiceOver
 - Added Plasma colour support, light and dark appearance, a collapsible navigator, and refreshed calendar views and dialogs. Checked light, dark, and narrow layouts in a Linux X11 session.
 - Verify discovery and conditional writes with fixtures before testing on a disposable iCloud calendar.
 - Added drag-to-create in Day and Week, before/after editing and display preferences, and local calendar profiles with ordering and accents.
+- Added Linux event edge resizing, calendar suggestions, activity icons, a desktop launcher, and GitHub update checks.
 - Add Google Tasks, colour categories, and support for mutating recurring and linked events after the initial preview.

@@ -44,6 +44,7 @@ class Event:
     notes: str
     raw: bytes
     editable: bool
+    recurring: bool = False
 
 
 @dataclass(frozen=True)
@@ -119,7 +120,7 @@ def occurrences(calendar, href, etag, raw, start, end, zone):
         ) and "[Link ID:" not in notes
         key = href + "#" + str(component.get("UID", "")) + "@" + begins.isoformat()
         yield Event(key, calendar, href, etag, str(component.get("SUMMARY", "")) or "Untitled event",
-                    begins, ends, all_day, notes, raw, editable)
+                    begins, ends, all_day, notes, raw, editable, recurring)
 
 
 class ICloudStore:
@@ -272,6 +273,23 @@ class ICloudStore:
             "Content-Type": "text/calendar; charset=utf-8", **precondition,
         })
 
+    def resize(self, event, start, end):
+        if not event.editable or event.all_day or not event.etag:
+            raise CalendarError("This event is read-only.")
+        if end.timestamp() <= start.timestamp():
+            raise CalendarError("The event must end after it starts.")
+        resource = icalendar.Calendar.from_ical(event.raw)
+        component = resource.walk("VEVENT")[0]
+        if start.timestamp() != event.start.timestamp():
+            replace_time(component, "DTSTART", start)
+        if end.timestamp() != event.end.timestamp() or "DTEND" not in component:
+            replace_time(component, "DTEND", end)
+        component.pop("DURATION", None)
+        replace(component, "DTSTAMP", datetime.now(timezone.utc))
+        self.request("PUT", event.href, resource.to_ical(), {
+            "Content-Type": "text/calendar; charset=utf-8", "If-Match": event.etag,
+        })
+
     def delete(self, event):
         if not event.editable:
             raise CalendarError("This event is read-only.")
@@ -282,6 +300,16 @@ def replace(component, name, value):
     component.pop(name, None)
     if value is not None:
         component.add(name, value)
+
+
+def replace_time(component, name, value):
+    prototype = component.get(name) or component["DTSTART"]
+    params = dict(prototype.params)
+    zone = prototype.dt.tzinfo
+    wall_time = value.astimezone(zone) if zone else value.replace(tzinfo=None)
+    component.pop(name, None)
+    component.add(name, wall_time, parameters=params)
+
 
 
 def calendar_date(value, weekly=False):

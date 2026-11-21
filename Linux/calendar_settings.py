@@ -45,6 +45,7 @@ class Preferences:
     month_timed: bool = True
     blend: bool = False
     lighter: bool = False
+    suggest_calendars: bool = True
     entry_mode: str = "schedule"
     duration: int = 60
     default_calendar: str = ""
@@ -231,6 +232,8 @@ class SettingsDialog(Qt.QDialog):
         self.tabs.addTab(self.display_page(), "Display")
         self.tabs.addTab(self.timing_page(), "Before && After")
         self.tabs.addTab(self.entry_page(), "Quick Entry")
+        self.updates_tab = self.updates_page()
+        self.tabs.addTab(self.updates_tab, "Updates")
         column.addWidget(self.tabs, 1)
         column.addWidget(dialog_buttons(self))
 
@@ -313,7 +316,7 @@ class SettingsDialog(Qt.QDialog):
         self.height = spin(prefs.hour_height, 44, 140, " px")
         for title, control in (("Appearance", self.appearance), ("Week starts on", self.week),
                                ("Time format", self.clock), ("Day layout", self.layout_mode),
-                               ("Drag selection increments", self.snap), ("Timeline hour height", self.height)):
+                               ("Drag and resize increments", self.snap), ("Timeline hour height", self.height)):
             form.addRow(title, control)
         row = Qt.QHBoxLayout()
         self.all_day = {}
@@ -351,7 +354,41 @@ class SettingsDialog(Qt.QDialog):
         form.addRow("Default mode", self.entry_mode)
         form.addRow("Default duration", self.duration)
         form.addRow("Default calendar", self.default_calendar)
+        self.suggest = CheckBox("Suggest calendars from previous events", checked=self.values.suggest_calendars)
+        form.addRow(self.suggest)
         return view
+
+    def updates_page(self):
+        view, form = self.form_page()
+        self.installed = label(tone="muted")
+        self.latest = label(tone="muted")
+        self.update_status = label()
+        self.update_status.setWordWrap(True)
+        self.check = button("Check for updates", "secondary")
+        self.install = button("Install update", "primary")
+        self.check.clicked.connect(self.owner.check_updates)
+        self.install.clicked.connect(self.owner.apply_update)
+        actions = Qt.QHBoxLayout()
+        actions.addWidget(self.check)
+        actions.addWidget(self.install)
+        actions.addStretch()
+        form.addRow("Installed version", self.installed)
+        form.addRow("GitHub version", self.latest)
+        form.addRow(self.update_status)
+        form.addRow(actions)
+        self.owner.update_changed.connect(self.update_details)
+        self.update_details()
+        return view
+
+    def update_details(self):
+        owner = self.owner
+        self.installed.setText(owner.installed_revision[:7] or "Unknown")
+        self.latest.setText(owner.remote_revision[:7] if owner.remote_revision else "Not checked")
+        self.update_status.setText(owner.update_message)
+        self.check.setEnabled(not owner.update_busy and not owner.update_launcher)
+        self.install.setText("Restart Calendar" if owner.update_launcher else "Install update")
+        available = owner.remote_revision and owner.installed_revision != owner.remote_revision
+        self.install.setEnabled(not owner.update_busy and bool(owner.update_launcher or available))
 
     def accept(self):
         p = self.values
@@ -366,10 +403,12 @@ class SettingsDialog(Qt.QDialog):
         p.lighter, p.blend = self.background.currentData(), self.blend.isChecked()
         p.entry_mode, p.duration = self.entry_mode.currentData(), self.duration.value()
         p.default_calendar = self.default_calendar.currentData()
+        p.suggest_calendars = self.suggest.isChecked()
         row = self.profile_list.currentRow()
         p.current = p.profiles[row - 1].id if row > 0 else ""
         self.owner.preferences = p
         p.store(self.owner.settings)
         self.owner.set_appearance(self.appearance.currentData())
         self.owner.refresh()
+        self.owner.history.seed()
         super().accept()
