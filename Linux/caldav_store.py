@@ -114,27 +114,40 @@ def event_times(component, zone):
     return begins, ends, all_day
 
 
+def event_from_component(calendar, href, etag, raw, component, zone, recurring):
+    if "DTSTART" not in component or str(component.get("STATUS", "")) == "CANCELLED":
+        return None
+    begins, ends, all_day = event_times(component, zone)
+    notes = str(component.get("DESCRIPTION", ""))
+    editable = calendar.writable and bool(etag) and not recurring and not any(
+        name in component for name in ("ATTENDEE", "ORGANIZER")
+    ) and "[Link ID:" not in notes
+    key = href + "#" + str(component.get("UID", "")) + "@" + begins.isoformat()
+    return Event(key, calendar, href, etag, str(component.get("SUMMARY", "")) or "Untitled event",
+                 begins, ends, all_day, notes, raw, editable, recurring)
+
+
+def event_in_range(event, start, end):
+    begins = event.start.timestamp()
+    return begins < end and (event.end.timestamp() > start or begins >= start)
+
+
+def single_event(calendar, href, etag, raw, zone):
+    component, = icalendar.Calendar.from_ical(raw).walk("VEVENT")
+    return event_from_component(calendar, href, etag, raw, component, zone, False)
+
+
 def occurrences(calendar, href, etag, raw, start, end, zone):
     resource = icalendar.Calendar.from_ical(raw)
     original = resource.walk("VEVENT")
     recurring = is_recurring(original)
     components = (recurring_ical_events.of(resource).between(start, end)
                   if recurring else original)
+    lower, upper = start.timestamp(), end.timestamp()
     for component in components:
-        if "DTSTART" not in component or str(component.get("STATUS", "")) == "CANCELLED":
-            continue
-        begins, ends, all_day = event_times(component, zone)
-        if begins.timestamp() >= end.timestamp() or (
-            ends.timestamp() <= start.timestamp() and begins.timestamp() < start.timestamp()
-        ):
-            continue
-        notes = str(component.get("DESCRIPTION", ""))
-        editable = calendar.writable and bool(etag) and not recurring and not any(
-            name in component for name in ("ATTENDEE", "ORGANIZER")
-        ) and "[Link ID:" not in notes
-        key = href + "#" + str(component.get("UID", "")) + "@" + begins.isoformat()
-        yield Event(key, calendar, href, etag, str(component.get("SUMMARY", "")) or "Untitled event",
-                    begins, ends, all_day, notes, raw, editable, recurring)
+        event = event_from_component(calendar, href, etag, raw, component, zone, recurring)
+        if event and event_in_range(event, lower, upper):
+            yield event
 
 
 class ICloudStore:

@@ -152,6 +152,23 @@ class StoreTests(unittest.TestCase):
 
 
 class CacheTests(unittest.TestCase):
+    def test_cached_one_off_event_reuses_decode_and_refreshes_changed_body(self):
+        with TemporaryDirectory() as folder:
+            cache = CalendarCache("demo@example.invalid", Path(folder))
+            store = Mock(spec=ICloudStore)
+            initial = replace(CAL, revision="sync:1")
+            store.event_resources.return_value = [(HREF, '"first"', DATA)]
+            cache.sync(store, [initial], Gate())
+            first, = cache.events(initial, START, END, ZONE)
+            repeated, = cache.events(initial, START - timedelta(hours=1), END, ZONE)
+            self.assertIs(first, repeated)
+            changed = replace(CAL, revision="sync:2")
+            store.event_resources.return_value = [(HREF, '"first"', DATA.replace(b"Original", b"Updated"))]
+            cache.sync(store, [changed], Gate())
+            fresh, = cache.events(changed, START, END, ZONE)
+            self.assertEqual(fresh.title, "Updated")
+            self.assertEqual(fresh.raw, DATA.replace(b"Original", b"Updated"))
+
     def test_complete_snapshots_skip_unchanged_data_and_keep_last_good_copy(self):
         with TemporaryDirectory() as folder:
             cache = CalendarCache("demo@example.invalid", Path(folder) / "cache")
@@ -498,7 +515,7 @@ class DesktopTests(unittest.TestCase):
             window.show()
             window.store = object()
             try:
-                with patch.object(window, "refresh"):
+                with patch.object(window, "refresh", side_effect=lambda **_: window.render()):
                     window.render()
                     self.assertTrue(wait_for(lambda: window.layout_bridge.active is not None))
                     process = window.layout_bridge.process.processId()
@@ -516,6 +533,85 @@ class DesktopTests(unittest.TestCase):
             finally:
                 window.close()
                 app.processEvents()
+
+    def test_busy_week_recycles_offscreen_cards_and_keeps_the_viewport(self):
+        from PySide6 import QtCore, QtTest
+        from calendar_app import Event, midnight
+        from calendar_timeline import ActivityCard, CARD_POOL_LIMIT
+
+        with TemporaryDirectory() as folder:
+            app, window = self.fixture_window(Path(folder) / "busy-week.ini")
+            window.store = object()
+            window.calendars = [CAL]
+
+            def populate(days):
+                return [Event(f"{day}-{slot}", CAL, HREF, "", f"Fixture event {slot}", start,
+                              start + timedelta(minutes=15), False, "", b"", False)
+                        for day in days for slot in range(72)
+                        for start in [midnight(day) + timedelta(minutes=slot * 20)]]
+
+            try:
+                window.events = populate(window.window_days())
+                window.render()
+                self.assertTrue(wait_for(lambda: window.timeline is not None))
+                timeline = window.timeline
+                bar = timeline.area.verticalScrollBar()
+                bar.setValue(0)
+                app.processEvents()
+                self.assertEqual(len(timeline.cards), 504)
+                first_widgets = set(timeline.live_cards.values())
+                self.assertLess(len(first_widgets), 350)
+                bar.setValue(bar.maximum())
+                app.processEvents()
+                QtCore.QCoreApplication.sendPostedEvents(None, QtCore.QEvent.Type.DeferredDelete)
+                self.assertTrue(first_widgets & set(timeline.live_cards.values()))
+                total_widgets = timeline.findChildren(ActivityCard, options=QtCore.Qt.FindChildOption.FindDirectChildrenOnly)
+                self.assertLessEqual(len(total_widgets), len(timeline.live_cards) + CARD_POOL_LIMIT)
+                visible_indexes = [index for index in timeline.live_cards if timeline.cards[index].top >= bar.value()]
+                index = visible_indexes[0]
+                entry = timeline.live_cards[index]
+                with patch.object(window, "open_editor") as open_event:
+                    QtTest.QTest.mouseClick(entry, QtCore.Qt.MouseButton.LeftButton, pos=entry.rect().center())
+                    open_event.assert_called_once_with(timeline.cards[index].item)
+                scroll = bar.value()
+                window.day += timedelta(days=7)
+                days = window.window_days()
+                window.events = populate(days)
+                window.render()
+                self.assertTrue(wait_for(lambda: window.timeline.days == days))
+                self.assertIs(window.timeline, timeline)
+                self.assertEqual(bar.value(), scroll)
+            finally:
+                window.close()
+
+    def test_month_reuses_cells_and_keeps_midnight_boundaries(self):
+        from calendar_app import Event, midnight
+
+        with TemporaryDirectory() as folder:
+            _, window = self.fixture_window(Path(folder) / "month.ini")
+            window.store = object()
+            window.mode = "Month"
+            start = midnight(window.day)
+            whole_day = Event("all-day", CAL, HREF, "", "Fixture day", start, start + timedelta(days=1),
+                              True, "", b"", False)
+            point = Event("next-day", CAL, HREF, "", "Fixture point", whole_day.end, whole_day.end,
+                          False, "", b"", False)
+            try:
+                window.events = [whole_day, point]
+                window.render()
+                page = window.month_page
+                index = window.window_days().index(window.day)
+                self.assertEqual(page.cells[index].items, [whole_day])
+                self.assertEqual(page.cells[index + 1].items, [point])
+                first = page.cells[0]
+                window.day = window.shift_month(window.day, 1)
+                window.events = []
+                window.render()
+                self.assertIs(window.month_page, page)
+                self.assertIs(page.cells[0], first)
+                self.assertEqual(first.day, window.window_days()[0])
+            finally:
+                window.close()
 
     def test_interact_then_close_during_calendar_refresh_and_history_import(self):
         from pathlib import Path
@@ -536,7 +632,11 @@ class DesktopTests(unittest.TestCase):
 
                 from PySide6 import QtCore, QtWidgets
 
-                previous_view = window.timeline
+                previous_track = window.timeline.track if window.timeline else None
+
+                def view_updated():
+                    return window.timeline is not None and window.timeline.track is not previous_track
+
                 rendered_during_dialog = []
                 deadline = monotonic() + 3
 
@@ -544,7 +644,7 @@ class DesktopTests(unittest.TestCase):
                     if len(window.events) != 54 and monotonic() < deadline:
                         QtCore.QTimer.singleShot(20, close_after_visible_result)
                         return
-                    rendered_during_dialog.append(window.timeline is not previous_view)
+                    rendered_during_dialog.append(view_updated())
                     modal = QtWidgets.QApplication.activeModalWidget()
                     if modal:
                         modal.reject()
@@ -554,7 +654,7 @@ class DesktopTests(unittest.TestCase):
                 window.open_settings()
                 self.assertEqual(rendered_during_dialog, [False])
                 self.assertTrue(wait_for(lambda: store.busy("history")))
-                self.assertTrue(wait_for(lambda: window.timeline is not previous_view))
+                self.assertTrue(wait_for(view_updated))
                 self.assertEqual(len(window.calendars), 15)
                 self.assertEqual(len(window.events), 54)
                 self.assertIn("14 calendars", window.status.text())
@@ -761,8 +861,11 @@ class DesktopTests(unittest.TestCase):
         window.change_view("Day")
         settle()
         timeline = window.timeline
-        _, _, entry = next(card for card in timeline.cards if card[2].item.key == saved.key)
-        timeline.area.verticalScrollBar().setValue(entry.y() - 90)
+        index, placement = next((index, placement) for index, placement in enumerate(timeline.cards)
+                                if placement.item.key == saved.key)
+        timeline.area.verticalScrollBar().setValue(placement.top - 90)
+        self.assertTrue(wait_for(lambda: index in timeline.live_cards))
+        entry = timeline.live_cards[index]
         point = QtCore.QPoint(entry.width() // 2, round(entry.geometry_data["coreBottom"]) - 2)
         original_end = saved.end.timestamp()
         target_y = timeline.displayed_top(0, original_end + 1800)

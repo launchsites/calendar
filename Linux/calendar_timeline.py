@@ -1,6 +1,7 @@
 """Interactive timed Day and Week canvas."""
 
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
+from collections import defaultdict
 from dataclasses import dataclass
 from math import ceil, floor
 from datetime import datetime
@@ -15,6 +16,9 @@ from desktop_style import EventButton, mix
 GUTTER = 58
 TRACK_PAD = 10
 SCROLLBAR = 10
+CARD_BAND = 128
+CARD_OVERSCAN = 180
+CARD_POOL_LIMIT = 32
 ALIGN = QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft
 
 
@@ -33,6 +37,15 @@ class ResizeDrag:
     end: float
 
 
+@dataclass(slots=True)
+class CardPlacement:
+    column: int
+    geometry: dict
+    item: object
+    top: int
+    height: int
+
+
 def interpolate(value, coordinates, values):
     index = bisect_left(coordinates, value)
     if index == 0:
@@ -46,25 +59,35 @@ def interpolate(value, coordinates, values):
 
 
 class ActivityCard(EventButton):
-    def __init__(self, event, geometry, owner, colors, parent, column):
-        time = owner.preferences.time_label
-        caption = f"{time(event.start)} – {time(event.end)}"
-        super().__init__(event, owner.look, caption=caption, parent=parent)
-        self.item = event
-        self.timeline = parent
-        self.column = column
-        self.geometry_data = geometry
+    def __init__(self, placement, timeline):
+        super().__init__(placement.item, timeline.look, parent=timeline)
+        self.timeline = timeline
         self.setMouseTracking(True)
+        self.released.connect(timeline.resume_render)
+        self.clicked.connect(lambda: timeline.owner.open_editor(self.item))
+        self.bind(placement)
+
+    def bind(self, placement):
+        event, geometry = placement.item, placement.geometry
+        owner = self.timeline.owner
+        self.item, self.column, self.geometry_data = event, placement.column, geometry
+        self.styling = self.timeline.look
         self.preferences = owner.preferences
+        time = owner.preferences.time_label
+        self.caption = f"{time(event.start)} – {time(event.end)}"
+        self.color = event.calendar.color
+        self.setText(event.title)
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self.before = Buffer(**geometry["before"]) if geometry["before"] else None
         self.after = Buffer(**geometry["after"]) if geometry["after"] else None
-        self.markers = [(item["start"], item["end"], colors[item["owner"]])
-                        for item in geometry["markers"] if item["owner"] in colors]
+        colors = self.timeline.colors
+        self.markers = sorted((item["start"], item["end"], colors[item["owner"]])
+                              for item in geometry["markers"] if item["owner"] in colors)
         details = [f"{side}: {buffer.summary()}" for side, buffer in (("Before", self.before), ("After", self.after))
                    if buffer]
-        if details:
-            self.setToolTip(self.toolTip() + "\n" + "\n".join(details))
-            self.setAccessibleName(self.toolTip())
+        tooltip = "\n".join([event.title, self.caption, *details])
+        self.setToolTip(tooltip)
+        self.setAccessibleName(tooltip)
 
     def resize_edge(self, y):
         if not self.item.editable or self.item.key in self.timeline.owner.resizing:
@@ -136,7 +159,7 @@ class ActivityCard(EventButton):
                 self.text_line(p, start, end - start, data.summary(), 11, left=28)
 
         cursor = top
-        for start, end, color in sorted(self.markers):
+        for start, end, color in self.markers:
             start, end = max(top, start), min(bottom, end)
             if end <= start:
                 continue
@@ -198,51 +221,122 @@ class ActivityCard(EventButton):
 class Timeline(Qt.QWidget):
     def __init__(self, owner, days, layout, events, area):
         super().__init__()
-        self.owner, self.days, self.track, self.area = owner, days, layout, area
-        self.look = owner.look
-        self.today = owner.now().date()
+        self.owner, self.area = owner, area
         self.zone = owner.now().tzinfo
         self.drag_anchor = None
         self.resize_drag = None
         self.drag_tip = None
         self.drag_moved = False
         self.drag_pointer = None
+        self.page_key = None
+        self.live_cards = {}
+        self.card_pool = []
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_OpaquePaintEvent)
         self.setFocusPolicy(QtCore.Qt.FocusPolicy.ClickFocus)
         self.setCursor(QtCore.Qt.CursorShape.CrossCursor)
         self.drag_scroll = QtCore.QTimer(self, interval=25)
         self.drag_scroll.timeout.connect(self.scroll_drag)
+        self.setSizePolicy(Qt.QSizePolicy.Policy.Expanding, Qt.QSizePolicy.Policy.Fixed)
+        self.overlay = TimelineOverlay(self)
+        self.clock = QtCore.QTimer(self, interval=15000)
+        self.clock.timeout.connect(self.overlay.update_clock)
+        self.clock.start()
+        area.verticalScrollBar().valueChanged.connect(self.update_visible_cards)
+        area.verticalScrollBar().rangeChanged.connect(self.update_visible_cards)
+        self.set_page(days, layout, events)
+
+    def set_page(self, days, layout, events):
+        now = self.owner.now()
+        key = (tuple(days), self.owner.look, now.date(), self.owner.preferences.clock, self.owner.preferences.lighter)
+        if self.page_key == key and self.track is layout and self.events == events:
+            self.overlay.update_clock()
+            return
+        self.page_key = key
+        self.days, self.track, self.events = days, layout, events
+        self.look, self.today = self.owner.look, now.date()
         self.snap_tops = [[point["top"] for point in day["snap"]] for day in layout]
         self.rulers = [([point["time"] for point in day["ruler"]], [point["top"] for point in day["ruler"]])
                        for day in layout]
+        self.hour_tops = [[round(hour["top"]) + TRACK_PAD for hour in day["hours"]] for day in layout]
+        self.hour_labels = [self.owner.preferences.time_label(datetime.fromtimestamp(hour["start"], self.zone))
+                            for hour in layout[0]["hours"]]
         by_key = {event.key: event for event in events}
-        colors = {event.key: event.calendar.color for event in events}
-        self.setMinimumHeight(int(max(x["height"] for x in layout)) + TRACK_PAD * 2)
-        self.setSizePolicy(Qt.QSizePolicy.Policy.Expanding, Qt.QSizePolicy.Policy.Fixed)
+        self.colors = {event.key: event.calendar.color for event in events}
+        for entry in self.live_cards.values():
+            entry.hide()
+            entry.setDown(False)
+            self.card_pool.append(entry)
+        self.live_cards.clear()
         self.cards = []
+        self.card_bands = defaultdict(list)
         for column, data in enumerate(layout):
             for card in sorted(data["cards"], key=lambda item: not item["behind"]):
                 event = by_key[card["id"]]
-                entry = ActivityCard(event, card, owner, colors, self, column)
-                entry.clicked.connect(lambda checked=False, item=event: self.owner.open_editor(item))
-                self.cards.append((column, card, entry))
-        self.overlay = TimelineOverlay(self)
-        self.overlay.raise_()
+                top = round(card["top"]) + TRACK_PAD + 1
+                height = max(1, round(card["height"]) - 2)
+                index = len(self.cards)
+                self.cards.append(CardPlacement(column, card, event, top, height))
+                for band in range(top // CARD_BAND, (top + height - 1) // CARD_BAND + 1):
+                    self.card_bands[band].append(index)
+        self.setMinimumHeight(int(max(day["height"] for day in layout)) + TRACK_PAD * 2)
+        self.update_visible_cards()
+        self.overlay.update_clock(force=True)
+        self.update()
 
     def x(self, column):
         return round(GUTTER + column * (self.width() - GUTTER) / len(self.days))
 
     def resizeEvent(self, event):
-        for column, card, entry in self.cards:
-            left = self.x(column + card["leading"]) + 4
-            right = self.x(column + card["trailing"]) - 4
-            entry.setGeometry(left, round(card["top"]) + TRACK_PAD + 1, max(1, right - left),
-                              max(1, round(card["height"]) - 2))
+        self.update_visible_cards()
+        for index, entry in self.live_cards.items():
+            self.position_card(entry, self.cards[index])
         self.overlay.setGeometry(self.rect())
         super().resizeEvent(event)
 
+    def position_card(self, entry, placement):
+        left = self.x(placement.column + placement.geometry["leading"]) + 4
+        right = self.x(placement.column + placement.geometry["trailing"]) - 4
+        entry.setGeometry(left, placement.top, max(1, right - left), placement.height)
+
+    def update_visible_cards(self, *_):
+        scroll = self.area.verticalScrollBar().value()
+        top = max(0, scroll - CARD_OVERSCAN)
+        end = scroll + self.area.viewport().height() + CARD_OVERSCAN
+        visible = {index for band in range(top // CARD_BAND, end // CARD_BAND + 1)
+                   for index in self.card_bands.get(band, ())
+                   if self.cards[index].top < end and self.cards[index].top + self.cards[index].height > top}
+        for index in self.live_cards.keys() - visible:
+            entry = self.live_cards[index]
+            if entry.hasFocus() or entry.isDown() or (self.resize_drag and self.resize_drag.card is entry):
+                continue
+            del self.live_cards[index]
+            entry.hide()
+            self.card_pool.append(entry)
+        missing = visible - self.live_cards.keys()
+        for index in sorted(missing):
+            placement = self.cards[index]
+            if self.card_pool:
+                entry = self.card_pool.pop()
+                entry.bind(placement)
+            else:
+                entry = ActivityCard(placement, self)
+            self.position_card(entry, placement)
+            entry.show()
+            self.live_cards[index] = entry
+        if missing:
+            above = self.overlay
+            for index in sorted(self.live_cards, reverse=True):
+                entry = self.live_cards[index]
+                if index in missing:
+                    entry.stackUnder(above)
+                above = entry
+        while len(self.card_pool) > CARD_POOL_LIMIT:
+            self.card_pool.pop().deleteLater()
+
     @property
     def interacting(self):
-        return self.drag_anchor is not None or self.resize_drag is not None
+        return (self.drag_anchor is not None or self.resize_drag is not None
+                or any(entry.isDown() for entry in self.live_cards.values()))
 
     def displayed_time(self, column, y):
         times, stops = self.rulers[column]
@@ -285,8 +379,9 @@ class Timeline(Qt.QWidget):
                 end += min(max(steps, minimum), maximum) * unit
         if end <= start:
             start, end = drag.card.item.start.timestamp(), drag.card.item.end.timestamp()
-        drag.start, drag.end = start, end
-        self.overlay.update()
+        if (drag.start, drag.end) != (start, end):
+            drag.start, drag.end = start, end
+            self.overlay.update_drag()
 
     def end_resize(self, point):
         drag = self.resize_drag
@@ -324,7 +419,7 @@ class Timeline(Qt.QWidget):
         self.drag_pointer = event.globalPosition().toPoint()
         self.press_position = self.drag_pointer
         self.drag_scroll.start()
-        self.overlay.update()
+        self.overlay.update_drag()
         event.accept()
 
     def mouseMoveEvent(self, event):
@@ -342,10 +437,10 @@ class Timeline(Qt.QWidget):
         slot = self.nearest_slot(column, y)
         if slot != self.drag_tip:
             self.drag_tip = slot
-            self.overlay.update()
+            self.overlay.update_drag()
 
     def scroll_drag(self):
-        if not self.interacting or not self.drag_moved:
+        if not self.drag_moved or self.drag_pointer is None:
             return
         viewport = self.area.viewport()
         pos = viewport.mapFromGlobal(self.drag_pointer)
@@ -375,7 +470,10 @@ class Timeline(Qt.QWidget):
         self.drag_scroll.stop()
         self.drag_anchor = self.drag_tip = self.drag_pointer = self.resize_drag = None
         self.drag_moved = False
-        self.overlay.update()
+        self.overlay.update_drag()
+        self.resume_render()
+
+    def resume_render(self):
         if self.owner.render_pending:
             self.owner.render_pending = False
             QtCore.QTimer.singleShot(0, self.owner, self.owner.render)
@@ -395,7 +493,7 @@ class Timeline(Qt.QWidget):
         event.accept()
 
     def keyPressEvent(self, event):
-        if self.interacting and event.key() == QtCore.Qt.Key.Key_Escape:
+        if (self.drag_anchor or self.resize_drag) and event.key() == QtCore.Qt.Key.Key_Escape:
             self.finish_drag()
             event.accept()
         else:
@@ -404,37 +502,85 @@ class Timeline(Qt.QWidget):
     def paintEvent(self, event):
         p = QtGui.QPainter(self)
         look = self.look
-        p.fillRect(event.rect(), QtGui.QColor(look.surface))
+        dirty = event.rect()
+        p.fillRect(dirty, QtGui.QColor(look.surface))
         font = self.font()
         font.setPixelSize(11)
         p.setFont(font)
-        time = self.owner.preferences.time_label
-        for column, (day, data) in enumerate(zip(self.days, self.track)):
+        grid = QtGui.QColor(look.grid)
+        muted = QtGui.QColor(look.muted)
+        for column, day in enumerate(self.days):
             left, right = self.x(column), self.x(column + 1)
+            if right < dirty.left() or (left > dirty.right() and column):
+                continue
             if day == self.today:
-                p.fillRect(left, 0, right - left, self.height(), QtGui.QColor(look.today_column))
+                p.fillRect(left, dirty.top(), right - left, dirty.height(), QtGui.QColor(look.today_column))
             elif day.weekday() >= 5:
-                p.fillRect(left, 0, right - left, self.height(), QtGui.QColor(look.weekend))
-            p.setPen(QtGui.QColor(look.grid))
-            p.drawLine(left, 0, left, self.height())
-            for hour in data["hours"]:
-                y = round(hour["top"]) + TRACK_PAD
-                p.setPen(QtGui.QColor(look.grid))
+                p.fillRect(left, dirty.top(), right - left, dirty.height(), QtGui.QColor(look.weekend))
+            p.setPen(grid)
+            p.drawLine(left, dirty.top(), left, dirty.bottom() + 1)
+            hours = self.hour_tops[column]
+            for index in range(bisect_left(hours, dirty.top() - 9), bisect_right(hours, dirty.bottom() + 9)):
+                y = hours[index]
+                p.setPen(grid)
                 p.drawLine(left, y, right, y)
                 if column == 0:
-                    p.setPen(QtGui.QColor(look.muted))
+                    p.setPen(muted)
                     p.drawText(QtCore.QRect(0, y - 9, GUTTER - 9, 18),
                                QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter,
-                               time(datetime.fromtimestamp(hour["start"], self.zone)))
+                               self.hour_labels[index])
 
 
 class TimelineOverlay(Qt.QWidget):
     def __init__(self, timeline):
         super().__init__(timeline)
         self.timeline = timeline
+        self.clock_position = None
+        self.drag_region = QtCore.QRect()
         self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
+    def clock_region(self, position):
+        if position is None:
+            return QtCore.QRect()
+        return QtCore.QRect(0, position[1] - 11, self.width(), 23)
+
+    def update_clock(self, *, force=False):
+        old = self.clock_position
+        self.clock_position = None
+        timeline = self.timeline
+        now = timeline.owner.now()
+        if now.date() in timeline.days:
+            column = timeline.days.index(now.date())
+            stamp = int(now.timestamp()) // 60 * 60
+            y = round(timeline.displayed_top(column, stamp))
+            self.clock_position = (column, y, now.strftime(":%M"))
+        if force or old != self.clock_position:
+            self.update(self.clock_region(old).united(self.clock_region(self.clock_position)))
+
+    def update_drag(self):
+        timeline = self.timeline
+        selection, drag = timeline.selection(), timeline.resize_drag
+        region = QtCore.QRect()
+        if selection:
+            column, start, end = selection
+            x, right = timeline.x(column), timeline.x(column + 1)
+            top = round(start["top"]) + TRACK_PAD
+            region = QtCore.QRect(x, top - 2, right - x, round(end["top"] - start["top"]) + 21)
+        if drag and timeline.drag_moved:
+            top = round(timeline.displayed_top(drag.column, drag.start))
+            bottom = round(timeline.displayed_top(drag.column, drag.end))
+            region = QtCore.QRect(drag.card.x() - 2, top - 13, drag.card.width() + 4, bottom - top + 26)
+        dirty = self.drag_region.united(region)
+        self.drag_region = region
+        if not dirty.isEmpty():
+            self.update(dirty)
+
     def paintEvent(self, event):
+        dirty = event.rect()
+        draw_drag = dirty.intersects(self.drag_region)
+        draw_clock = dirty.intersects(self.clock_region(self.clock_position))
+        if not draw_drag and not draw_clock:
+            return
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         timeline = self.timeline
@@ -444,7 +590,7 @@ class TimelineOverlay(Qt.QWidget):
         font.setPixelSize(11)
         font.setWeight(QtGui.QFont.Weight.DemiBold)
         p.setFont(font)
-        selection = timeline.selection()
+        selection = timeline.selection() if draw_drag else None
         time = timeline.owner.preferences.time_label
         if selection:
             column, start, end = selection
@@ -461,7 +607,7 @@ class TimelineOverlay(Qt.QWidget):
             text = full if p.fontMetrics().horizontalAdvance(full) <= width - 12 else a
             p.drawText(rect(x + 6, top + 1, width - 12, min(height, 21)), ALIGN, text)
         drag = timeline.resize_drag
-        if drag and timeline.drag_moved:
+        if draw_drag and drag and timeline.drag_moved:
             card = drag.card
             top = timeline.displayed_top(drag.column, drag.start)
             bottom = timeline.displayed_top(drag.column, drag.end)
@@ -475,10 +621,8 @@ class TimelineOverlay(Qt.QWidget):
             p.fillRect(rect(x + 5, y, min(112, width - 10), 22), accent)
             p.setPen(QtGui.QColor(look.on_accent))
             p.drawText(rect(x + 10, y, min(102, width - 20), 22), ALIGN, " – ".join(times))
-        for column, day in enumerate(timeline.track):
-            if day["now"] is None:
-                continue
-            y = round(day["now"]) + TRACK_PAD
+        if draw_clock:
+            column, y, label = self.clock_position
             left, right = timeline.x(column), timeline.x(column + 1)
             p.setPen(QtGui.QPen(accent, 1.5))
             p.drawLine(left, y, right, y)
@@ -487,5 +631,4 @@ class TimelineOverlay(Qt.QWidget):
             p.setPen(QtCore.Qt.PenStyle.NoPen)
             p.drawRoundedRect(rect(3, y - 9, GUTTER - 7, 18), 5, 5)
             p.setPen(QtGui.QColor(look.on_accent))
-            now = timeline.owner.now()
-            p.drawText(rect(3, y - 9, GUTTER - 7, 18), QtCore.Qt.AlignmentFlag.AlignCenter, now.strftime(":%M"))
+            p.drawText(rect(3, y - 9, GUTTER - 7, 18), QtCore.Qt.AlignmentFlag.AlignCenter, label)

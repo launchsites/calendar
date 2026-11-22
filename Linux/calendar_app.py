@@ -24,6 +24,7 @@ from calendar_install import APP_ID, installed_revision, window_icon
 from calendar_history import CalendarHistory
 from calendar_cache import CalendarCache
 from calendar_layout import LayoutBridge
+from calendar_month import MonthPage
 from background_jobs import BackgroundJobs
 from activity_icons import activity_icon
 from calendar_update import install_update, latest_revision
@@ -369,6 +370,10 @@ class CalendarWindow(Qt.QMainWindow):
         self.timeline = None
         self.resizing = set()
         self.snapshot = None
+        self.loaded_query = None
+        self.timed_header_key = None
+        self.month_key = None
+        self.month_page = None
         self.connecting = False
         self.is_demo = False
         self.sidebar_preferred = self.settings.value("showNavigator", True, bool)
@@ -756,15 +761,21 @@ class CalendarWindow(Qt.QMainWindow):
         active = set(days if self.mode == "Week" else [self.day])
         for index, item in enumerate(self.mini_buttons):
             day = grid_start + timedelta(days=index)
-            item.setText(str(day.day))
-            item.setAccessibleName(day.strftime("%A %d %B %Y"))
-            item.setToolTip(item.accessibleName())
-            item.setProperty("day", day)
-            item.setProperty("inRange", day in active)
-            item.setProperty("outside", day.month != first.month)
-            item.setProperty("today", day == today)
-            item.style().unpolish(item)
-            item.style().polish(item)
+            if item.property("day") != day:
+                item.setText(str(day.day))
+                item.setAccessibleName(day.strftime("%A %d %B %Y"))
+                item.setToolTip(item.accessibleName())
+                item.setProperty("day", day)
+            properties = (("inRange", day in active), ("outside", day.month != first.month), ("today", day == today))
+            changed = False
+            for name, value in properties:
+                if item.property(name) != value:
+                    item.setProperty(name, value)
+                    changed = True
+            if changed:
+                item.style().unpolish(item)
+                item.style().polish(item)
+                item.update()
 
     def update_calendar_list(self):
         active = self.preferences.active_profile
@@ -854,8 +865,10 @@ class CalendarWindow(Qt.QMainWindow):
 
     def navigate(self):
         self.navigator_month = self.day.replace(day=1)
-        self.render()
-        self.refresh()
+        if self.store or self.cached_urls:
+            self.refresh(reuse=True)
+        else:
+            self.render()
 
     def connect_dialog(self):
         if self.connecting:
@@ -1033,17 +1046,23 @@ class CalendarWindow(Qt.QMainWindow):
 
         self.work(read, done)
 
-    def refresh(self):
+    def refresh(self, *, reuse=False):
         if self.jobs.stopping.is_set() or not (self.store or self.cached_urls):
             return
-        if self.reading:
-            self.refresh_pending = True
-            return
-        self.reading = True
         days = self.window_days()
         pad = timedelta(days=1 if self.mode in ("Day", "Week") else 0)
         start, end = midnight(days[0]) - pad, midnight(days[-1] + timedelta(days=1)) + pad
         visible = [item for item in self.calendars if item.url not in self.hidden()]
+        sources = tuple(visible), self.store, self.cache
+        if reuse and self.loaded_query:
+            previous_start, previous_end, previous_sources = self.loaded_query
+            if previous_sources == sources and previous_start <= start and end <= previous_end:
+                self.render()
+                return
+        if self.reading:
+            self.refresh_pending = True
+            return
+        self.reading = True
         store, cache, cached, stopping = self.store, self.cache, self.cached_urls, self.jobs.stopping
         if not cached:
             self.set_status("Refreshing calendars…", "working")
@@ -1103,6 +1122,7 @@ class CalendarWindow(Qt.QMainWindow):
             events, failures = result
             if events or not failures or self.snapshot != (days[0], days[-1]):
                 self.events, self.snapshot = events, (days[0], days[-1])
+                self.loaded_query = None if failures else (start, end, sources)
                 self.render()
             if failures:
                 self.set_status(f"{len(failures)} calendar(s) could not refresh. {failures[0]}", "error")
@@ -1141,6 +1161,9 @@ class CalendarWindow(Qt.QMainWindow):
 
     def clear_canvas(self):
         self.timeline = None
+        self.timed_header_key = None
+        self.month_key = None
+        self.month_page = None
         while self.canvas.count():
             widget = self.canvas.takeAt(0).widget()
             widget.hide()
@@ -1159,10 +1182,15 @@ class CalendarWindow(Qt.QMainWindow):
             return
         self.render_pending = False
         days = self.window_days()
+        window_start, window_end = midnight(days[0]), midnight(days[-1] + timedelta(days=1))
+        pad = timedelta(days=1)
+        timed_start, timed_end = window_start - pad, window_end + pad
         hidden = self.hidden()
         events = [item for item in self.events if item.calendar.url not in hidden
                   and (self.preferences.all_day.get(self.mode, True) if item.all_day
-                       else self.mode != "Month" or self.preferences.month_timed)]
+                       else self.mode != "Month" or self.preferences.month_timed)
+                  and (item.start < window_end and item.end >= window_start if item.all_day or self.mode == "Month"
+                       else item.start < timed_end and item.end >= timed_start)]
         connected = self.store or self.cached_urls
         if connected and self.mode != "Month":
             result = self.layout_bridge.result({
@@ -1171,7 +1199,6 @@ class CalendarWindow(Qt.QMainWindow):
                 "days": [midnight(day).timestamp() for day in days],
                 "items": [{"id": item.key, "start": item.start.timestamp(), "end": item.end.timestamp(),
                            "notes": item.notes} for item in events if not item.all_day],
-                "now": int(self.now().timestamp()) // 60 * 60,
                 "adaptive": self.mode == "Day" and self.preferences.adaptive,
                 "pointsPerHour": self.preferences.hour_height,
                 "snapMinutes": self.preferences.snap,
@@ -1194,17 +1221,25 @@ class CalendarWindow(Qt.QMainWindow):
             self.range_label.clear()
         self.update_mini()
         self.update_calendar_list()
-        self.clear_canvas()
         if not connected:
+            self.clear_canvas()
             self.draw_empty()
             if not self.status.text():
                 self.set_status("No account connected")
             return
         if self.mode == "Month":
-            self.draw_month(days, events)
+            key = (days, self.day.month, self.now().date(), self.look, self.preferences.clock, events)
+            if key != self.month_key:
+                if self.month_page is None:
+                    self.clear_canvas()
+                    self.month_page = MonthPage(self)
+                    self.canvas.addWidget(self.month_page, 1)
+                self.month_page.set_days(days, events, key[2])
+                self.month_key = key
         else:
             layout, error = result
             if error:
+                self.clear_canvas()
                 self.canvas.addWidget(label(error), 1)
             else:
                 self.draw_timeline(days, events, layout)
@@ -1272,7 +1307,7 @@ class CalendarWindow(Qt.QMainWindow):
         for cell in columns:
             row.addWidget(cell, 1)
         row.addSpacing(SCROLLBAR)
-        self.canvas.addWidget(header)
+        return header
 
     def draw_all_day(self, days, events):
         by_day = [[item for item in self.events_on(day, events) if item.all_day] for day in days]
@@ -1301,70 +1336,44 @@ class CalendarWindow(Qt.QMainWindow):
             stack.addStretch()
             row.addWidget(lane, 1)
         row.addSpacing(SCROLLBAR)
-        self.canvas.addWidget(area)
+        return area
 
     def draw_timeline(self, days, events, layout):
-        if len(days) > 1:
-            self.draw_day_headers(days)
-        self.draw_all_day(days, events)
-        area = Qt.QScrollArea(widgetResizable=True)
-        area.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
-        area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.timeline = Timeline(self, days, layout, events, area)
-        area.setWidget(self.timeline)
-        self.canvas.addWidget(area, 1)
-        bar = area.verticalScrollBar()
-        if getattr(self, "timeline_scroll", None) is None:
-            hour = max(0, min(8, self.now().hour - 1)) if self.now().date() in days else 8
-            self.timeline_scroll = round(layout[0]["hours"][min(hour, len(layout[0]["hours"]) - 1)]["top"])
-        position = self.timeline_scroll
-        QtCore.QTimer.singleShot(0, area, lambda: bar.setValue(position))
-        bar.valueChanged.connect(lambda value: setattr(self, "timeline_scroll", value))
-
-    def draw_month(self, days, events):
-        container = Qt.QWidget(objectName="monthPage")
-        grid = Qt.QGridLayout(container)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(0)
-        for day in range(7):
-            grid.setColumnStretch(day, 1)
-            text = label(days[day].strftime("%A"), tone="muted", size=12, weight=QtGui.QFont.Weight.DemiBold)
-            text.setContentsMargins(10, 0, 0, 0)
-            text.setFixedHeight(31)
-            grid.addWidget(text, 0, day)
-        today = self.now().date()
-        for index, day in enumerate(days):
-            row, column = divmod(index, 7)
-            grid.setRowStretch(row + 1, 1)
-            outside = day.month != self.day.month
-            card = Qt.QWidget()
-            card.setProperty("monthCell", "today" if day == today else
-                             "muted" if outside or day.weekday() >= 5 else "normal")
-            card.setSizePolicy(Qt.QSizePolicy.Policy.Ignored, Qt.QSizePolicy.Policy.Preferred)
-            card.setMinimumHeight(101)
-            box = Qt.QVBoxLayout(card)
-            box.setContentsMargins(6, 4, 6, 4)
-            box.setSpacing(3)
-            items = sorted(self.events_on(day, events), key=lambda item: not item.all_day)
-            num = button(str(day.day), "date", name=day.strftime("%A %-d %B"), size=(25, 23))
-            num.setSizePolicy(Qt.QSizePolicy.Policy.Fixed, Qt.QSizePolicy.Policy.Fixed)
-            num.setProperty("monthNumber", True)
-            num.setProperty("outside", outside)
-            num.setProperty("today", day == today)
-            num.clicked.connect(lambda checked=False, d=day, e=items: self.preview(d, e))
-            box.addWidget(num, alignment=QtCore.Qt.AlignmentFlag.AlignLeft)
-            for item in items[:2]:
-                box.addWidget(self.event_button(item, "" if item.all_day else self.preferences.time_label(item.start)))
-            if len(items) > 2:
-                more = button(f"+{len(items) - 2} more", "overflow")
-                more.clicked.connect(lambda checked=False, d=day, e=items: self.preview(d, e))
-                box.addWidget(more)
-            box.addStretch()
-            grid.addWidget(card, row + 1, column)
-        area = Qt.QScrollArea(widgetResizable=True)
-        area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        area.setWidget(container)
-        self.canvas.addWidget(area, 1)
+        if self.timeline:
+            self.timeline.set_page(days, layout, events)
+        else:
+            self.clear_canvas()
+            top = Qt.QWidget()
+            self.timed_header = Qt.QVBoxLayout(top)
+            self.timed_header.setContentsMargins(0, 0, 0, 0)
+            self.timed_header.setSpacing(0)
+            self.canvas.addWidget(top)
+            area = Qt.QScrollArea(widgetResizable=True)
+            area.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+            area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.timeline = Timeline(self, days, layout, events, area)
+            area.setWidget(self.timeline)
+            self.canvas.addWidget(area, 1)
+            bar = area.verticalScrollBar()
+            if getattr(self, "timeline_scroll", None) is None:
+                hour = max(0, min(8, self.now().hour - 1)) if self.now().date() in days else 8
+                self.timeline_scroll = round(layout[0]["hours"][min(hour, len(layout[0]["hours"]) - 1)]["top"])
+            position = self.timeline_scroll
+            QtCore.QTimer.singleShot(0, area, lambda: bar.setValue(position))
+            bar.valueChanged.connect(lambda value: setattr(self, "timeline_scroll", value))
+        all_day = [item for item in events if item.all_day]
+        key = (days, self.now().date(), self.look, all_day)
+        if key != self.timed_header_key:
+            while self.timed_header.count():
+                widget = self.timed_header.takeAt(0).widget()
+                widget.hide()
+                widget.deleteLater()
+            if len(days) > 1:
+                self.timed_header.addWidget(self.draw_day_headers(days))
+            ribbon = self.draw_all_day(days, all_day)
+            if ribbon:
+                self.timed_header.addWidget(ribbon)
+            self.timed_header_key = key
 
     def open_day(self, day):
         self.day = day

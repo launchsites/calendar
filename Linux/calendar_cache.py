@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import timezone
+from functools import lru_cache
 from hashlib import sha256
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ import sqlite3
 
 import icalendar
 
-from caldav_store import Calendar, CalendarError, event_times, is_recurring, occurrences
+from caldav_store import Calendar, CalendarError, event_in_range, event_times, is_recurring, occurrences, single_event
 
 
 SCHEMA = """
@@ -50,6 +51,7 @@ class CalendarCache:
     def __init__(self, username, directory=None):
         account = sha256(username.strip().casefold().encode()).hexdigest()
         self.path = (directory if directory is not None else cache_directory()) / f"{account}.sqlite3"
+        self.decode_event = lru_cache(maxsize=1024)(single_event)
 
     @contextmanager
     def _write(self):
@@ -76,18 +78,24 @@ class CalendarCache:
     def events(self, calendar, start, end, zone):
         # Floating and all-day dates were indexed as UTC wall time, so allow for time-zone shifts.
         margin = 2 * 86400
+        lower, upper = start.timestamp(), end.timestamp()
         with closing(sqlite3.connect(self.path)) as db:
             rows = db.execute(
-                """SELECT href, etag, raw FROM resources WHERE calendar = ? AND ends IS NULL
+                """SELECT href, etag, raw, ends FROM resources WHERE calendar = ? AND ends IS NULL
                    UNION ALL
-                   SELECT href, etag, raw FROM resources WHERE calendar = ? AND ends >= ? AND starts < ?""",
-                (calendar.url, calendar.url, start.timestamp() - margin, end.timestamp() + margin),
+                   SELECT href, etag, raw, ends FROM resources WHERE calendar = ? AND ends >= ? AND starts < ?""",
+                (calendar.url, calendar.url, lower - margin, upper + margin),
             ).fetchall()
         events = {}
-        for href, etag, raw in rows:
+        for href, etag, raw, indexed_end in rows:
             try:
-                for item in occurrences(calendar, href, etag, raw, start, end, zone):
-                    events[item.key] = item
+                if indexed_end is None:
+                    events.update((item.key, item) for item in occurrences(calendar, href, etag, raw, start, end, zone))
+                else:
+                    decode = self.decode_event if len(raw) <= 16384 else single_event
+                    item = decode(calendar, href, etag, raw, zone)
+                    if item and event_in_range(item, lower, upper):
+                        events[item.key] = item
             except (ValueError, TypeError, KeyError, OverflowError):
                 continue
         return list(events.values())

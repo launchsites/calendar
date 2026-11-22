@@ -300,20 +300,23 @@ def label(text="", *, tone=None, size=None, weight=None):
 
 class EventButton(Qt.QPushButton):
     def __init__(self, event, style, *, compact=False, caption="", parent=None):
-        super().__init__(event.title, parent)
-        self.styling = style
+        super().__init__(parent)
         self.setProperty("eventCard", True)
         self.setProperty("compact", compact)
-        self.color = event.calendar.color
         self.compact = compact
-        self.caption = caption
-        self.setToolTip(event.title + ("\n" + caption if caption else ""))
-        self.setAccessibleName(self.toolTip())
         self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self.setMinimumWidth(0)
         self.setSizePolicy(Qt.QSizePolicy.Policy.Ignored, Qt.QSizePolicy.Policy.Fixed)
         if compact:
             self.setFixedHeight(25)
+        self.set_event(event, style, caption)
+
+    def set_event(self, event, style, caption):
+        self.styling, self.color, self.caption = style, event.calendar.color, caption
+        self.setText(event.title)
+        self.setToolTip(event.title + ("\n" + caption if caption else ""))
+        self.setAccessibleName(self.toolTip())
+        self.update()
 
     def paintEvent(self, event):
         style = self.styling

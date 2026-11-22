@@ -96,4 +96,5 @@ Physical-device startup was verified. Simulator runs, calendar writes, VoiceOver
 - Deliver background load results on the GUI thread, load the visible range before importing history, and install launcher icons at 256px and 512px.
 - Show saved-account reconnect progress and display the first calendars as results arrive. Reuse a background Swift layout process for Day and Week.
 - Launch installed builds without requiring Swift on PATH. Keep per-account event snapshots for offline browsing and check iCloud calendar versions in the background.
+- Reuse the timed viewport and month cells, and recycle timed event controls as they enter and leave the viewport. Paint the visible ruler and keep the current-time marker independent of layout.
 - Add Google Tasks, colour categories, and support for mutating recurring and linked events after the initial preview.
