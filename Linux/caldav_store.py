@@ -1,7 +1,9 @@
 """A range-based iCloud Calendar store with conditional writes."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
+from hashlib import sha256
+import json
 import re
 from urllib.parse import urljoin, urlsplit
 from uuid import uuid4
@@ -15,8 +17,10 @@ import requests
 DAV = "{DAV:}"
 CAL = "{urn:ietf:params:xml:ns:caldav}"
 APPLE = "{http://apple.com/ns/ical/}"
+SERVER = "{http://calendarserver.org/ns/}"
 ROOT = "https://caldav.icloud.com/"
-NS = 'xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:a="http://apple.com/ns/ical/"'
+NS = ('xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav" '
+      'xmlns:a="http://apple.com/ns/ical/" xmlns:s="http://calendarserver.org/ns/"')
 
 
 class CalendarError(Exception):
@@ -29,6 +33,7 @@ class Calendar:
     title: str
     color: str
     writable: bool
+    revision: str = field(default="", compare=False)
 
 
 @dataclass(frozen=True)
@@ -88,28 +93,37 @@ def local_time(value, zone):
     return datetime.combine(value, time.min, zone)
 
 
+def is_recurring(components):
+    return len(components) != 1 or any(
+        name in component for component in components
+        for name in ("RRULE", "RDATE", "EXDATE", "RECURRENCE-ID", "EXRULE")
+    )
+
+
+def event_times(component, zone):
+    raw_start = component.decoded("DTSTART")
+    all_day = not isinstance(raw_start, datetime)
+    begins = local_time(raw_start, zone)
+    if "DTEND" in component:
+        ends = local_time(component.decoded("DTEND"), zone)
+    else:
+        duration = component.decoded("DURATION") if "DURATION" in component else (
+            timedelta(days=1) if all_day else timedelta()
+        )
+        ends = begins + duration
+    return begins, ends, all_day
+
+
 def occurrences(calendar, href, etag, raw, start, end, zone):
     resource = icalendar.Calendar.from_ical(raw)
     original = resource.walk("VEVENT")
-    recurring = len(original) != 1 or any(
-        name in component for component in original
-        for name in ("RRULE", "RDATE", "EXDATE", "RECURRENCE-ID", "EXRULE")
-    )
+    recurring = is_recurring(original)
     components = (recurring_ical_events.of(resource).between(start, end)
                   if recurring else original)
     for component in components:
         if "DTSTART" not in component or str(component.get("STATUS", "")) == "CANCELLED":
             continue
-        raw_start = component.decoded("DTSTART")
-        all_day = not isinstance(raw_start, datetime)
-        begins = local_time(raw_start, zone)
-        if "DTEND" in component:
-            ends = local_time(component.decoded("DTEND"), zone)
-        else:
-            duration = component.decoded("DURATION") if "DURATION" in component else (
-                timedelta(days=1) if all_day else timedelta()
-            )
-            ends = begins + duration
+        begins, ends, all_day = event_times(component, zone)
         if begins.timestamp() >= end.timestamp() or (
             ends.timestamp() <= start.timestamp() and begins.timestamp() < start.timestamp()
         ):
@@ -127,6 +141,7 @@ class ICloudStore:
     def __init__(self, username, password, *, stop_reads=None):
         self.credentials = (username, password)
         self.stop_reads = stop_reads
+        self.home = None
 
     def request(self, method, url, body=None, headers=None):
         target = cloud_url(ROOT, url)
@@ -169,14 +184,15 @@ class ICloudStore:
         return response.url, list(properties(root))
 
     def discover(self):
-        base, rows = self.query("PROPFIND", ROOT, f'<d:propfind {NS}><d:prop>'
-                                '<d:current-user-principal/></d:prop></d:propfind>', 0)
-        principal = self.find_href(base, rows, DAV + "current-user-principal")
-        base, rows = self.query("PROPFIND", principal, f'<d:propfind {NS}><d:prop>'
-                                '<c:calendar-home-set/></d:prop></d:propfind>', 0)
-        home = self.find_href(base, rows, CAL + "calendar-home-set")
-        base, rows = self.query("PROPFIND", home, f'<d:propfind {NS}><d:prop>'
-                                '<d:displayname/><d:resourcetype/><a:calendar-color/>'
+        if not self.home:
+            base, rows = self.query("PROPFIND", ROOT, f'<d:propfind {NS}><d:prop>'
+                                    '<d:current-user-principal/></d:prop></d:propfind>', 0)
+            principal = self.find_href(base, rows, DAV + "current-user-principal")
+            base, rows = self.query("PROPFIND", principal, f'<d:propfind {NS}><d:prop>'
+                                    '<c:calendar-home-set/></d:prop></d:propfind>', 0)
+            self.home = self.find_href(base, rows, CAL + "calendar-home-set")
+        base, rows = self.query("PROPFIND", self.home, f'<d:propfind {NS}><d:prop>'
+                                '<d:displayname/><d:resourcetype/><a:calendar-color/><d:sync-token/><s:getctag/>'
                                 '<c:supported-calendar-component-set/><d:current-user-privilege-set/>'
                                 '</d:prop></d:propfind>', 1)
         calendars = {}
@@ -197,7 +213,11 @@ class ICloudStore:
             url = cloud_url(base, href)
             if not url.endswith("/"):
                 url += "/"
-            calendars[url] = Calendar(url, title, color[:7] if re.fullmatch(r"#[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?", color) else "#6197e8", writable)
+            sync_token = getattr(values.get(DAV + "sync-token"), "text", None)
+            ctag = getattr(values.get(SERVER + "getctag"), "text", None)
+            revision = f"sync:{sync_token}" if sync_token else f"ctag:{ctag}" if ctag else ""
+            calendars[url] = Calendar(url, title, color[:7] if re.fullmatch(r"#[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?", color) else "#6197e8",
+                                      writable, revision)
         return sorted(calendars.values(), key=lambda calendar: calendar.title.casefold())
 
     @staticmethod
@@ -209,21 +229,50 @@ class ICloudStore:
                 return cloud_url(base, href)
         raise CalendarError("iCloud didn’t provide a calendar location for this account.")
 
-    def events(self, calendar, start, end, zone):
-        begin, finish = (value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                         for value in (start, end))
+    def event_resources(self, calendar, start=None, end=None):
+        span = ""
+        if start is not None and end is not None:
+            begin, finish = (value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                             for value in (start, end))
+            span = f'<c:time-range start="{begin}" end="{finish}"/>'
         base, rows = self.query("REPORT", calendar.url, f'<c:calendar-query {NS}>'
                                 '<d:prop><d:getetag/><c:calendar-data/></d:prop>'
                                 '<c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT">'
-                                f'<c:time-range start="{begin}" end="{finish}"/>'
+                                f'{span}'
                                 '</c:comp-filter></c:comp-filter></c:filter></c:calendar-query>', 1)
-        events = {}
         for href, values in rows:
             data = getattr(values.get(CAL + "calendar-data"), "text", None)
             if data:
                 tag = getattr(values.get(DAV + "getetag"), "text", "") or ""
-                for event in occurrences(calendar, cloud_url(base, href), tag, data.encode(), start, end, zone):
-                    events[event.key] = event
+                yield cloud_url(base, href), tag, data.encode()
+            elif start is None and cloud_url(base, href).rstrip("/") != calendar.url.rstrip("/"):
+                raise CalendarError("iCloud returned an incomplete calendar. The saved copy is still available.")
+
+    def resource_revision(self, calendar):
+        base, rows = self.query("PROPFIND", calendar.url, f'<d:propfind {NS}><d:prop>'
+                                '<d:getetag/><d:resourcetype/></d:prop></d:propfind>', 1)
+        versions = []
+        for href, values in rows:
+            url = cloud_url(base, href)
+            types = values.get(DAV + "resourcetype")
+            if url.rstrip("/") == calendar.url.rstrip("/") or (
+                types is not None and types.find(DAV + "collection") is not None
+            ):
+                continue
+            tag = getattr(values.get(DAV + "getetag"), "text", None)
+            if not tag:
+                return ""
+            versions.append((url, tag))
+        if not rows:
+            return ""
+        digest = sha256(json.dumps(sorted(versions)).encode()).hexdigest()
+        return f"etag:{digest}"
+
+    def events(self, calendar, start, end, zone):
+        events = {}
+        for href, tag, raw in self.event_resources(calendar, start, end):
+            for event in occurrences(calendar, href, tag, raw, start, end, zone):
+                events[event.key] = event
         return sorted(events.values(), key=lambda event: event.start)
 
     def save(self, calendar, draft, original=None):

@@ -40,13 +40,17 @@ class CalendarHistory:
         if not calendars or not owner.store:
             return
         store, key = owner.store, self.key
+        cache, cached = owner.cache, owner.cached_urls
         core, stopping = owner.core, owner.jobs.stopping
         end = owner.now()
         start = end - timedelta(days=180)
         self.seeding = True
 
         def load(calendar):
-            return [] if stopping.is_set() else store.events(calendar, start, end, end.tzinfo)
+            if stopping.is_set():
+                return []
+            source = cache if calendar.url in cached else store
+            return source.events(calendar, start, end, end.tzinfo)
 
         def read():
             with ThreadPoolExecutor(max_workers=2) as workers:

@@ -34,7 +34,7 @@ Scripts/run-linux --demo
 Scripts/run-linux
 ```
 
-Setup registers Calendar in the desktop app menu with 256px and 512px icons. If an older install shows a generic icon, rerun `Scripts/setup-linux` and reopen Calendar from the app menu. You can also start it with `Scripts/run-linux`. Demo uses sample data in memory. A connection to Apple is only needed for the live calendar view.
+Setup registers Calendar in the desktop app menu with 256px and 512px icons. If an older install shows a generic icon, rerun `Scripts/setup-linux` and reopen Calendar from the app menu. You can also start it with `Scripts/run-linux`, which uses the installed build without needing Swift on the launcher's PATH. Demo uses sample data in memory.
 
 ## Updates
 
@@ -47,6 +47,8 @@ Calendar checks the published GitHub commit at launch and shows a notice when it
 3. Use **Calendars** to show only the calendars you want. Changes to writable calendars go directly to iCloud over CalDAV and sync to the other devices on that account. Apple’s existing sharing permissions determine access.
 
 The app can remember the password in the Linux Secret Service keyring (for example GNOME Keyring or a compatible wallet). If the service is unavailable, the connection lasts for the current session. Revoke the app-specific password in your Apple Account to remove access.
+
+For a remembered account, Calendar saves calendar events on this device as it syncs. Later launches open the saved view while iCloud checks calendar versions in the background. A changed calendar is downloaded again, and a failed refresh leaves the last saved copy available. You can browse saved events offline. Edits still need iCloud. The cache is stored outside the checkout in the current user's cache directory (`$XDG_CACHE_HOME/stillday` or `~/.cache/stillday`). The database contains event details and has user-only file permissions.
 
 ## Preview limits
 

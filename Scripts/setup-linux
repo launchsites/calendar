@@ -7,14 +7,44 @@ if [[ "$(uname -s)" != Linux ]]; then
     exit 1
 fi
 
-if ! command -v swift >/dev/null || ! command -v pkg-config >/dev/null ||
-   ! pkg-config --exists libcrypto; then
+swift_bin="$(type -P swift || true)"
+if [[ ! -x "$swift_bin" && -r .build/linux-swift-path ]]; then
+    read -r swift_bin < .build/linux-swift-path || true
+fi
+if [[ ! -x "$swift_bin" && -r .build/release/description.json ]]; then
+    swift_bin="$(python3 - .build/release/description.json 2>/dev/null <<'PY' || true
+import json
+from pathlib import Path
+import sys
+
+commands = json.loads(Path(sys.argv[1]).read_text())["swiftCommands"]
+for command in commands.values():
+    compiler = Path(command["executable"])
+    driver = compiler.with_name("swift")
+    if compiler.is_absolute() and compiler.name == "swiftc" and driver.is_file():
+        print(driver)
+        break
+PY
+)"
+fi
+if [[ ! -x "$swift_bin" ]]; then
+    for candidate in "${SWIFTLY_BIN_DIR:-${SWIFTLY_HOME_DIR:-$HOME/.local/share/swiftly}/bin}/swift" "$HOME/.local/bin/swift"; do
+        if [[ -x "$candidate" ]]; then
+            swift_bin="$candidate"
+            break
+        fi
+    done
+fi
+
+if [[ ! -x "$swift_bin" ]] || ! command -v pkg-config >/dev/null || ! pkg-config --exists libcrypto; then
     echo "Install Swift 6+, pkg-config and the OpenSSL development headers first. See Linux/README.md." >&2
     exit 1
 fi
 
-swift build -c release --product calendar-linux-core
+[[ "$swift_bin" = /* ]] || swift_bin="$PWD/$swift_bin"
+"$swift_bin" build -c release --product calendar-linux-core
 python3 -m venv .build/linux-venv
 .build/linux-venv/bin/python -m pip install -r Linux/requirements.txt
 .build/linux-venv/bin/python Linux/calendar_install.py
+printf '%s\n' "$swift_bin" > .build/linux-swift-path
 printf '\nStart Calendar with Scripts/run-linux (or add --demo for sample events).\n'

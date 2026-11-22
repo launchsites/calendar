@@ -2,16 +2,20 @@
 
 import os
 import sys
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Event as Gate, Lock
 from time import monotonic
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import icalendar
 import requests
 
 from caldav_store import Calendar, CalendarError, Draft, ICloudStore, cloud_url, occurrences
+from calendar_cache import CalendarCache
 
 
 ZONE = timezone.utc
@@ -33,6 +37,7 @@ class StoreTests(unittest.TestCase):
             '<d:current-user-principal><d:href>/1/principal/</d:href></d:current-user-principal>',
             '<c:calendar-home-set><d:href>/1/calendars/</d:href></c:calendar-home-set>',
             '<d:displayname>Work</d:displayname><a:calendar-color>#5489dfFF</a:calendar-color>'
+            '<d:sync-token>fixture-version</d:sync-token>'
             '<d:resourcetype><d:collection/><c:calendar/></d:resourcetype>'
             '<d:current-user-privilege-set><d:privilege><d:read/></d:privilege></d:current-user-privilege-set>',
         ]
@@ -49,7 +54,22 @@ class StoreTests(unittest.TestCase):
 
         store = ICloudStore("demo@example.invalid", "fixture")
         with patch.object(store, "request", side_effect=request):
-            self.assertEqual(store.discover(), [Calendar(CAL.url, "Work", "#5489df", False)])
+            found, = store.discover()
+            self.assertEqual(found, Calendar(CAL.url, "Work", "#5489df", False))
+            self.assertEqual(found.revision, "sync:fixture-version")
+
+    def test_resource_revision_checks_membership_and_is_independent_of_order(self):
+        from defusedxml import ElementTree as XML
+
+        store = ICloudStore("demo@example.invalid", "fixture")
+        first = (HREF, {"{DAV:}getetag": XML.fromstring('<d:getetag xmlns:d="DAV:">"one"</d:getetag>')})
+        second = (CAL.url + "another.ics", first[1])
+        with patch.object(store, "query", side_effect=[(CAL.url, [first, second]),
+                                                      (CAL.url, [second, first]), (CAL.url, [first])]):
+            revision = store.resource_revision(CAL)
+            self.assertTrue(revision.startswith("etag:"))
+            self.assertEqual(revision, store.resource_revision(CAL))
+            self.assertNotEqual(revision, store.resource_revision(CAL))
 
     def test_redirect_never_sends_credentials_to_another_site(self):
         response = requests.Response()
@@ -129,6 +149,42 @@ class StoreTests(unittest.TestCase):
             with self.assertRaisesRegex(CalendarError, "loading was cancelled"):
                 store.events(CAL, START, END, ZONE)
             self.assertEqual(request.call_count, 1)
+
+
+class CacheTests(unittest.TestCase):
+    def test_complete_snapshots_skip_unchanged_data_and_keep_last_good_copy(self):
+        with TemporaryDirectory() as folder:
+            cache = CalendarCache("demo@example.invalid", Path(folder) / "cache")
+            stopping = Gate()
+            store = Mock(spec=ICloudStore)
+            initial = replace(CAL, revision="sync:1")
+            recurring = DATA.replace(b"END:VEVENT", b"RRULE:FREQ=DAILY\r\nEND:VEVENT")
+            store.event_resources.return_value = [(HREF, '"first"', recurring)]
+            self.assertEqual(cache.sync(store, [initial], stopping), ({CAL.url}, {CAL.url}))
+            self.assertEqual(cache.path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(cache.path.parent.stat().st_mode & 0o777, 0o700)
+            restored = CalendarCache("DEMO@example.invalid", cache.path.parent)
+            future = START + timedelta(days=90)
+            event, = restored.events(initial, future, future + timedelta(hours=2), ZONE)
+            self.assertEqual((event.title, event.start, event.etag), ("Original", future, '"first"'))
+            self.assertEqual(CalendarCache("other@example.invalid", cache.path.parent).catalog(), {})
+            self.assertEqual(cache.sync(store, [initial], stopping), ({CAL.url}, {CAL.url}))
+            store.event_resources.assert_called_once_with(initial)
+
+            def incomplete(calendar):
+                yield HREF, '"new"', DATA
+                raise CalendarError("Incomplete response")
+
+            updated = replace(CAL, revision="sync:2")
+            store.event_resources.side_effect = incomplete
+            self.assertEqual(cache.sync(store, [updated], stopping), ({CAL.url}, set()))
+            self.assertEqual(restored.catalog()[CAL.url].revision, "sync:1")
+            self.assertEqual(restored.events(initial, future, future + timedelta(hours=2), ZONE)[0].etag, '"first"')
+            store.event_resources.side_effect = None
+            store.event_resources.return_value = []
+            self.assertEqual(cache.sync(store, [updated], stopping), ({CAL.url}, {CAL.url}))
+            self.assertEqual(restored.events(updated, START, END, ZONE), [])
+            self.assertEqual(cache.sync(store, [], stopping), (set(), set()))
 
 
 class InstallTests(unittest.TestCase):
@@ -235,6 +291,13 @@ class SlowCalendarStore:
         self.wait(self.discovery, "discovery")
         return self.calendars
 
+    def resource_revision(self, calendar):
+        return "fixture"
+
+    def event_resources(self, calendar):
+        self.wait(self.history, "history")
+        return []
+
     def events(self, calendar, start, end, zone):
         historical = (end - start).days >= 100
         gate, name = (self.history, "history") if historical else (self.visible, "visible")
@@ -314,10 +377,7 @@ class DesktopTests(unittest.TestCase):
                 window.close()
 
     def test_saved_account_shows_loading_and_renders_early_calendar(self):
-        from pathlib import Path
-        from tempfile import TemporaryDirectory
-
-        with TemporaryDirectory() as folder:
+        with TemporaryDirectory() as folder, patch.dict(os.environ, {"XDG_CACHE_HOME": folder}):
             _, window = self.fixture_window(Path(folder) / "reconnect.ini")
             store = SlowCalendarStore(window.jobs.stopping)
             window.settings.setValue("iCloudEmail", "demo@example.invalid")
@@ -337,12 +397,64 @@ class DesktopTests(unittest.TestCase):
                 self.assertFalse(store.busy("history"))
                 self.assertIn("Refreshing calendars", window.status.text())
                 store.visible.set()
-                self.assertTrue(wait_for(lambda: window.timeline and len(window.timeline.cards) == 56))
-                self.assertIn("14 calendars", window.status.text())
+                self.assertTrue(wait_for(lambda: window.timeline and len(window.timeline.cards) == 56
+                                         and "14 calendars" in window.status.text()))
             finally:
                 for gate in (store.discovery, store.visible, store.history):
                     gate.set()
                 window.close()
+
+    def test_reopen_displays_saved_events_before_icloud_and_browses_offline(self):
+        with TemporaryDirectory() as folder:
+            directory = Path(folder) / "event-cache"
+            cache = CalendarCache("demo@example.invalid", directory)
+            store = Mock(spec=ICloudStore)
+            calendar = replace(CAL, revision="sync:1")
+            series = DATA.replace(b"END:VEVENT", b"RRULE:FREQ=WEEKLY\r\nEND:VEVENT")
+            store.event_resources.return_value = [(HREF, '"first"', series)]
+            store.discover.return_value = [calendar]
+            store.events.side_effect = lambda cal, start, end, zone: list(
+                occurrences(cal, HREF, '"first"', series, start, end, zone)
+            )
+            settings = Path(folder) / "calendar.ini"
+            discovery = Gate()
+
+            def offline():
+                discovery.wait(5)
+                raise CalendarError("No connection.")
+
+            with (patch("calendar_app.keyring.backends.SecretService.Keyring") as keyring,
+                  patch("calendar_cache.cache_directory", return_value=directory),
+                  patch("calendar_app.ICloudStore", return_value=store)):
+                keyring.return_value.get_password.return_value = "fixture"
+                _, first_window = self.fixture_window(settings)
+                first_window.settings.setValue("iCloudEmail", "demo@example.invalid")
+                try:
+                    first_window.start()
+                    self.assertTrue(wait_for(lambda: first_window.cached_urls == {CAL.url}))
+                    self.assertTrue(cache.path.exists())
+                finally:
+                    first_window.close()
+
+                store.events.reset_mock()
+                store.discover.side_effect = offline
+                _, window = self.fixture_window(settings)
+                try:
+                    window.start()
+                    self.assertTrue(wait_for(lambda: window.timeline and len(window.timeline.cards) == 1))
+                    self.assertTrue(window.connecting)
+                    self.assertEqual(window.account.text(), "iCloud")
+                    self.assertEqual(window.status.text(), "Showing saved calendars")
+                    discovery.set()
+                    self.assertTrue(wait_for(lambda: not window.connecting))
+                    window.advance(2)
+                    self.assertTrue(wait_for(lambda: window.timeline.days == window.window_days()
+                                             and len(window.timeline.cards) == 1))
+                    self.assertIsNone(window.store)
+                    store.events.assert_not_called()
+                finally:
+                    discovery.set()
+                    window.close()
 
     def test_missing_saved_credential_restores_sign_in(self):
         from pathlib import Path
