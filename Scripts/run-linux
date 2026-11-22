@@ -1,14 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd -- "${BASH_SOURCE[0]%/*}/.."
 
-if [[ ! -x .build/linux-venv/bin/python ]] || ! command -v swift >/dev/null; then
+bin="$PWD/.build/release/calendar-linux-core"
+if [[ ! -x .build/linux-venv/bin/python || ! -x "$bin" ]]; then
     echo "Run Scripts/setup-linux first." >&2
     exit 1
 fi
-bin="$(swift build -c release --show-bin-path)"
-if [[ ! -x "$bin/calendar-linux-core" ]]; then
-    echo "Run Scripts/setup-linux to build Calendar’s shared engine." >&2
-    exit 1
-fi
-exec .build/linux-venv/bin/python Linux/calendar_app.py --core "$bin/calendar-linux-core" "$@"
+exec .build/linux-venv/bin/python -X faulthandler Linux/calendar_app.py --core "$bin" "$@"
