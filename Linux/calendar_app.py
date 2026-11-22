@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from queue import Empty, SimpleQueue
 import subprocess
 import sys
 from uuid import uuid4
@@ -20,6 +21,7 @@ from desktop_style import CheckBox, DesktopStyle, EventButton, button, icon, lab
 from calendar_settings import Buffer, Preferences, SettingsDialog, edit_buffer
 from calendar_install import APP_ID, installed_revision, window_icon
 from calendar_history import CalendarHistory
+from calendar_layout import LayoutBridge
 from background_jobs import BackgroundJobs
 from activity_icons import activity_icon
 from calendar_update import install_update, latest_revision
@@ -346,7 +348,10 @@ class CalendarWindow(Qt.QMainWindow):
         self.update_busy = False
         self.update_launcher = None
         self.jobs = BackgroundJobs(self)
-        Qt.QApplication.instance().aboutToQuit.connect(self.jobs.stop)
+        self.layout_bridge = LayoutBridge(core.binary, self)
+        app = Qt.QApplication.instance()
+        app.aboutToQuit.connect(self.jobs.stop)
+        app.aboutToQuit.connect(self.layout_bridge.stop)
         self.day, self.mode = self.now().date(), "Week"
         self.navigator_month = self.day.replace(day=1)
         self.store, self.calendars, self.events = None, [], []
@@ -401,6 +406,11 @@ class CalendarWindow(Qt.QMainWindow):
         )
         self.render_timer = QtCore.QTimer(self, interval=50, singleShot=True)
         self.render_timer.timeout.connect(self.render)
+        self.layout_bridge.updated.connect(self.render)
+        self.first_results = None
+        self.first_events = []
+        self.first_paint = QtCore.QTimer(self, interval=140)
+        self.first_paint.timeout.connect(self.render_first_results)
         self.timer = QtCore.QTimer(self, interval=180000)
         self.timer.timeout.connect(self.refresh)
         self.timer.start()
@@ -413,9 +423,11 @@ class CalendarWindow(Qt.QMainWindow):
         super().closeEvent(event)
         if event.isAccepted():
             self.jobs.stop()
+            self.layout_bridge.stop()
             self.timer.stop()
             self.update_timer.stop()
             self.render_timer.stop()
+            self.first_paint.stop()
 
     def icon_button(self, glyph, name, action, *, size=(34, 34)):
         item = button(variant="nav", name=name, size=size)
@@ -782,16 +794,9 @@ class CalendarWindow(Qt.QMainWindow):
 
 
     def start(self):
-        if self.jobs.stopping.is_set():
-            return
         username = self.settings.value("iCloudEmail", "", str)
         if username:
-            try:
-                password = keyring.backends.SecretService.Keyring().get_password(SERVICE, username)
-            except Exception:
-                password = None
-            if password:
-                self.connect_account(username, password, remember=False)
+            self.connect_account(username, None, remember=False)
 
     def work(self, action, done, *, cancel_on_close=True):
         self.jobs.submit(action, done, cancel_on_close=cancel_on_close)
@@ -867,28 +872,48 @@ class CalendarWindow(Qt.QMainWindow):
             secret.clear()
 
     def connect_account(self, username, password, remember):
+        if self.connecting or self.jobs.stopping.is_set():
+            return
         self.connecting = True
-        store = ICloudStore(username, password, stop_reads=self.jobs.stopping)
+        stopping = self.jobs.stopping
+        self.account.setEnabled(False)
+        self.account.setText("Connecting…")
         self.set_status("Connecting to iCloud…", "working")
+        self.render()
 
-        def done(calendars, error):
-            self.connecting = False
-            if error:
-                self.set_status(error, "error")
-                return
-            self.store, self.calendars, self.events, self.snapshot = store, calendars, [], None
-            self.account.setText("iCloud")
-            self.settings.setValue("iCloudEmail", username)
-            self.session_notice = ""
-            if remember:
+        def discover():
+            credential = password
+            if credential is None:
                 try:
-                    keyring.backends.SecretService.Keyring().set_password(SERVICE, username, password)
+                    credential = keyring.backends.SecretService.Keyring().get_password(SERVICE, username)
                 except Exception:
-                    self.session_notice = "One-session sign-in. The system keyring is unavailable."
+                    return None
+            if not credential or stopping.is_set():
+                return None
+            store = ICloudStore(username, credential, stop_reads=stopping)
+            calendars = store.discover()
+            if remember and not stopping.is_set():
+                try:
+                    keyring.backends.SecretService.Keyring().set_password(SERVICE, username, credential)
+                except Exception:
+                    return store, calendars, "One-session sign-in. The system keyring is unavailable."
+            return store, calendars, ""
+
+        def done(connection, error):
+            self.connecting = False
+            self.account.setEnabled(True)
+            self.account.setText("iCloud" if connection or self.store else "Connect iCloud")
+            if not connection:
+                self.set_status(error or "Connect iCloud to load your calendars.", "error" if error else None)
+                self.render()
+                return
+            store, calendars, self.session_notice = connection
+            self.store, self.calendars, self.events, self.snapshot = store, calendars, [], None
+            self.settings.setValue("iCloudEmail", username)
             self.history.open(username, start_import=False)
             self.refresh()
 
-        self.work(store.discover, done)
+        self.work(discover, done)
 
     def visibility(self):
         dialog = Qt.QDialog(self)
@@ -947,13 +972,21 @@ class CalendarWindow(Qt.QMainWindow):
         visible = [item for item in self.calendars if item.url not in self.hidden()]
         store, stopping = self.store, self.jobs.stopping
         self.set_status("Refreshing calendars…", "working")
+        progress = SimpleQueue() if self.snapshot is None else None
+        if progress is not None:
+            self.first_results, self.first_events = progress, []
+            self.first_paint.start()
+            self.render()
 
         def read():
             def load(calendar):
                 if stopping.is_set():
                     return [], None
                 try:
-                    return store.events(calendar, start, end, ZONE), None
+                    records = store.events(calendar, start, end, ZONE)
+                    if progress is not None and records:
+                        progress.put(records)
+                    return records, None
                 except CalendarError as error:
                     return [], str(error)
                 except (ValueError, TypeError, KeyError):
@@ -965,10 +998,12 @@ class CalendarWindow(Qt.QMainWindow):
                     events.extend(records)
                     if failure:
                         failures.append(failure)
-            return sorted(events, key=lambda event: event.start.timestamp()), failures
+            return sorted(events, key=lambda event: (event.start.timestamp(), event.key)), failures
 
         def done(result, error):
             self.reading = False
+            self.first_paint.stop()
+            self.first_results, self.first_events = None, []
             current = self.window_days()
             if self.refresh_pending:
                 self.refresh_pending = False
@@ -995,6 +1030,19 @@ class CalendarWindow(Qt.QMainWindow):
 
         self.work(read, done)
 
+    def render_first_results(self):
+        if self.refresh_pending or self.first_results is None:
+            return
+        count = len(self.first_events)
+        try:
+            while True:
+                self.first_events.extend(self.first_results.get_nowait())
+        except Empty:
+            pass
+        if len(self.first_events) != count:
+            self.events = sorted(self.first_events, key=lambda event: (event.start.timestamp(), event.key))
+            self.render()
+
     def events_on(self, day, events):
         start, end = midnight(day), midnight(day + timedelta(days=1))
         return [item for item in events if item.start < end and
@@ -1020,6 +1068,27 @@ class CalendarWindow(Qt.QMainWindow):
             return
         self.render_pending = False
         days = self.window_days()
+        hidden = self.hidden()
+        events = [item for item in self.events if item.calendar.url not in hidden
+                  and (self.preferences.all_day.get(self.mode, True) if item.all_day
+                       else self.mode != "Month" or self.preferences.month_timed)]
+        if self.store and self.mode != "Month":
+            result = self.layout_bridge.result({
+                "operation": "layout",
+                "timeZone": str(ZONE),
+                "days": [midnight(day).timestamp() for day in days],
+                "items": [{"id": item.key, "start": item.start.timestamp(), "end": item.end.timestamp(),
+                           "notes": item.notes} for item in events if not item.all_day],
+                "now": int(self.now().timestamp()) // 60 * 60,
+                "adaptive": self.mode == "Day" and self.preferences.adaptive,
+                "pointsPerHour": self.preferences.hour_height,
+                "snapMinutes": self.preferences.snap,
+                "blend": self.preferences.blend,
+            })
+            if result is None:
+                return
+        else:
+            self.layout_bridge.latest = None
         if self.mode == "Week":
             first, last = days[0], days[-1]
             left = first.strftime("%-d" if first.month == last.month else "%-d %b")
@@ -1039,14 +1108,14 @@ class CalendarWindow(Qt.QMainWindow):
             if not self.status.text():
                 self.set_status("No account connected")
             return
-        hidden = self.hidden()
-        events = [item for item in self.events if item.calendar.url not in hidden
-                  and (self.preferences.all_day.get(self.mode, True) if item.all_day
-                       else self.mode != "Month" or self.preferences.month_timed)]
         if self.mode == "Month":
             self.draw_month(days, events)
         else:
-            self.draw_timeline(days, events)
+            layout, error = result
+            if error:
+                self.canvas.addWidget(label(error), 1)
+            else:
+                self.draw_timeline(days, events, layout)
 
     def draw_empty(self):
         panel = Qt.QWidget()
@@ -1059,16 +1128,19 @@ class CalendarWindow(Qt.QMainWindow):
         glyph.setPixmap(icon("calendar", self.look.accent, 42).pixmap(42, 42))
         layout.addWidget(glyph, alignment=center)
         layout.addSpacing(7)
-        layout.addWidget(label("Connect your calendars", size=21, weight=QtGui.QFont.Weight.DemiBold),
-                         alignment=center)
-        caption = label("See and edit your iCloud events from this device.", tone="muted", size=13)
+        title = "Connecting to iCloud…" if self.connecting else "Connect your calendars"
+        layout.addWidget(label(title, size=21, weight=QtGui.QFont.Weight.DemiBold), alignment=center)
+        message = ("Your calendars will appear as they load." if self.connecting
+                   else "See and edit your iCloud events from this device.")
+        caption = label(message, tone="muted", size=13)
         caption.setWordWrap(True)
         caption.setAlignment(center)
         layout.addWidget(caption)
-        layout.addSpacing(7)
-        connect = button("Connect iCloud", "primary")
-        connect.clicked.connect(self.connect_dialog)
-        layout.addWidget(connect, alignment=center)
+        if not self.connecting:
+            layout.addSpacing(7)
+            connect = button("Connect iCloud", "primary")
+            connect.clicked.connect(self.connect_dialog)
+            layout.addWidget(connect, alignment=center)
         layout.addStretch(2)
         self.canvas.addWidget(panel, 1)
 
@@ -1139,21 +1211,10 @@ class CalendarWindow(Qt.QMainWindow):
         row.addSpacing(SCROLLBAR)
         self.canvas.addWidget(area)
 
-    def draw_timeline(self, days, events):
+    def draw_timeline(self, days, events, layout):
         if len(days) > 1:
             self.draw_day_headers(days)
         self.draw_all_day(days, events)
-        payload = [{"id": item.key, "start": item.start.timestamp(), "end": item.end.timestamp(),
-                    "notes": item.notes} for item in events if not item.all_day]
-        try:
-            layout = self.core.call("layout", days=[midnight(day).timestamp() for day in days],
-                                    items=payload, now=self.now().timestamp(),
-                                    adaptive=self.mode == "Day" and self.preferences.adaptive,
-                                    pointsPerHour=self.preferences.hour_height,
-                                    snapMinutes=self.preferences.snap, blend=self.preferences.blend)
-        except CalendarError as error:
-            self.canvas.addWidget(label(str(error)), 1)
-            return
         area = Qt.QScrollArea(widgetResizable=True)
         area.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
         area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1369,11 +1430,11 @@ def main():
     app.setApplicationName(APP_ID)
     settings = QtCore.QSettings("Stillday", "Calendar Demo" if options.demo else "Calendar")
     window = CalendarWindow(Core(str(options.core.resolve())), settings=settings)
-    window.show()
     if options.demo:
         demo(window)
     else:
-        QtCore.QTimer.singleShot(0, window.start)
+        window.start()
+    window.show()
     QtCore.QTimer.singleShot(1500, window, window.check_updates)
     return app.exec()
 

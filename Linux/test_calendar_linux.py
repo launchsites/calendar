@@ -1,6 +1,7 @@
 """Disposable CalDAV fixtures and desktop smoke coverage."""
 
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from threading import Event as Gate, Lock
 from time import monotonic
@@ -208,6 +209,7 @@ class SlowCalendarStore:
         self.discovery = Gate()
         self.history = Gate()
         self.visible = Gate()
+        self.early = Gate()
         self.lock = Lock()
         self.active = {"discovery": 0, "visible": 0, "history": 0}
         self.calendars = [
@@ -236,6 +238,8 @@ class SlowCalendarStore:
     def events(self, calendar, start, end, zone):
         historical = (end - start).days >= 100
         gate, name = (self.history, "history") if historical else (self.visible, "visible")
+        if not historical and calendar is self.calendars[0] and self.early.is_set():
+            gate = self.early
         if not self.wait(gate, name):
             return []
         from caldav_store import Event
@@ -308,6 +312,98 @@ class DesktopTests(unittest.TestCase):
             finally:
                 store.discovery.set()
                 window.close()
+
+    def test_saved_account_shows_loading_and_renders_early_calendar(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as folder:
+            _, window = self.fixture_window(Path(folder) / "reconnect.ini")
+            store = SlowCalendarStore(window.jobs.stopping)
+            window.settings.setValue("iCloudEmail", "demo@example.invalid")
+            window.settings.setValue("hiddenCalendars", [store.calendars[-2].url])
+            try:
+                with (patch("calendar_app.keyring.backends.SecretService.Keyring") as keyring,
+                      patch("calendar_app.ICloudStore", return_value=store)):
+                    keyring.return_value.get_password.return_value = "fixture"
+                    window.start()
+                    self.assertFalse(window.account.isEnabled())
+                    self.assertEqual(window.account.text(), "Connecting…")
+                    self.assertTrue(wait_for(lambda: store.busy("discovery")))
+                store.early.set()
+                store.discovery.set()
+                self.assertTrue(wait_for(lambda: window.timeline and len(window.timeline.cards) == 4))
+                self.assertTrue(store.busy("visible"))
+                self.assertFalse(store.busy("history"))
+                self.assertIn("Refreshing calendars", window.status.text())
+                store.visible.set()
+                self.assertTrue(wait_for(lambda: window.timeline and len(window.timeline.cards) == 56))
+                self.assertIn("14 calendars", window.status.text())
+            finally:
+                for gate in (store.discovery, store.visible, store.history):
+                    gate.set()
+                window.close()
+
+    def test_missing_saved_credential_restores_sign_in(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as folder:
+            _, window = self.fixture_window(Path(folder) / "missing-credential.ini")
+            window.settings.setValue("iCloudEmail", "demo@example.invalid")
+            try:
+                with (patch("calendar_app.keyring.backends.SecretService.Keyring") as keyring,
+                      patch("calendar_app.ICloudStore") as store):
+                    keyring.return_value.get_password.return_value = None
+                    window.start()
+                    self.assertTrue(wait_for(lambda: window.account.isEnabled()))
+                    self.assertEqual(window.account.text(), "Connect iCloud")
+                    store.assert_not_called()
+            finally:
+                window.close()
+
+    def test_delayed_layout_keeps_gui_responsive_and_only_draws_current_view(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+
+        from PySide6 import QtCore, QtWidgets
+        from calendar_app import CalendarWindow, Core, ZONE
+
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+        with TemporaryDirectory() as folder:
+            gate = Path(folder) / "release"
+            launcher = Path(folder) / "slow-core"
+            binary = os.environ["CALENDAR_CORE_TEST_BIN"]
+            launcher.write_text(
+                f"#!{sys.executable}\nimport os, sys, time\n"
+                f"while not os.path.exists({str(gate)!r}):\n    time.sleep(0.01)\n"
+                f"os.execv({binary!r}, [{binary!r}, *sys.argv[1:]])\n"
+            )
+            launcher.chmod(0o700)
+            prefs = QtCore.QSettings(str(Path(folder) / "slow-layout.ini"), QtCore.QSettings.Format.IniFormat)
+            window = CalendarWindow(Core(str(launcher)), clock=lambda: datetime(2026, 11, 21, 13, tzinfo=ZONE),
+                                    settings=prefs)
+            window.show()
+            window.store = object()
+            try:
+                with patch.object(window, "refresh"):
+                    window.render()
+                    self.assertTrue(wait_for(lambda: window.layout_bridge.active is not None))
+                    process = window.layout_bridge.process.processId()
+                    QtCore.QTimer.singleShot(0, lambda: window.change_view("Month"))
+                    self.assertTrue(wait_for(lambda: window.mode == "Month"))
+                    self.assertFalse(gate.exists())
+                    self.assertIsNone(window.timeline)
+                    window.change_view("Day")
+                    gate.touch()
+                    self.assertTrue(wait_for(lambda: window.timeline is not None))
+                    self.assertEqual(window.timeline.days, [window.day])
+                    window.change_view("Week")
+                    self.assertTrue(wait_for(lambda: len(window.timeline.days) == 7))
+                    self.assertEqual(window.layout_bridge.process.processId(), process)
+            finally:
+                window.close()
+                app.processEvents()
 
     def test_interact_then_close_during_calendar_refresh_and_history_import(self):
         from pathlib import Path
@@ -401,7 +497,7 @@ class DesktopTests(unittest.TestCase):
         demo(window)
 
         def settle():
-            self.assertTrue(wait_for(lambda: not window.jobs.busy))
+            self.assertTrue(wait_for(lambda: not window.jobs.busy and not window.layout_bridge.busy))
             app.processEvents()
 
         settle()

@@ -218,13 +218,24 @@ private func run(_ request: Request) throws -> Any {
     }
 }
 
-do {
+private func respond(to data: Data) throws -> Data {
     let decoder = JSONDecoder()
     decoder.dateDecodingStrategy = .secondsSince1970
-    let request = try decoder.decode(Request.self, from: FileHandle.standardInput.readDataToEndOfFile())
-    let response = try JSONSerialization.data(withJSONObject: ["value": run(request)])
-    FileHandle.standardOutput.write(response)
-} catch {
-    let response = try JSONSerialization.data(withJSONObject: ["error": error.localizedDescription])
+    do {
+        let request = try decoder.decode(Request.self, from: data)
+        return try JSONSerialization.data(withJSONObject: ["value": run(request)])
+    } catch {
+        return try JSONSerialization.data(withJSONObject: ["error": error.localizedDescription])
+    }
+}
+
+if CommandLine.arguments.dropFirst().first == "--stream" {
+    while let line = readLine() {
+        var response = try respond(to: Data(line.utf8))
+        response.append(10)
+        FileHandle.standardOutput.write(response)
+    }
+} else {
+    let response = try respond(to: FileHandle.standardInput.readDataToEndOfFile())
     FileHandle.standardOutput.write(response)
 }
